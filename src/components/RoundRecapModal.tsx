@@ -1,5 +1,5 @@
 import React from 'react';
-import { Trophy, CheckCircle2, XCircle, ArrowRight, FileText } from 'lucide-react';
+import { Trophy, CheckCircle2, XCircle, ArrowRight, FileText, LogOut } from 'lucide-react';
 import { SUIT_NAMES_RO, SUIT_SYMBOLS, Suit } from '../game/rules.ts';
 import { sounds } from '../utils/audio.ts';
 
@@ -21,8 +21,10 @@ interface RoundRecapModalProps {
   cardCount: number;
   trumpSuit: Suit | null;
   results: PlayerRoundResult[];
+  userSeat?: number;
   onNextRound: () => void;
   onOpenScoreTable: () => void;
+  onLeaveTable?: () => void;
 }
 
 export const RoundRecapModal: React.FC<RoundRecapModalProps> = ({
@@ -31,10 +33,13 @@ export const RoundRecapModal: React.FC<RoundRecapModalProps> = ({
   cardCount,
   trumpSuit,
   results,
+  userSeat = 0,
   onNextRound,
   onOpenScoreTable,
+  onLeaveTable,
 }) => {
-  const isUserSuccess = results[0]?.bid === results[0]?.tricksWon;
+  const myResult = results.find((r) => r.playerId === userSeat) || results[0];
+  const isUserSuccess = myResult?.bid === myResult?.tricksWon;
 
   React.useEffect(() => {
     if (isUserSuccess) {
@@ -77,7 +82,7 @@ export const RoundRecapModal: React.FC<RoundRecapModalProps> = ({
               <div
                 key={player.playerId}
                 className={`p-3 rounded-xl border flex items-center justify-between transition-all ${
-                  player.playerId === 0
+                  player.playerId === userSeat
                     ? made
                       ? 'bg-emerald-950/60 border-emerald-500/70 shadow-md ring-1 ring-emerald-500/40'
                       : 'bg-rose-950/50 border-rose-500/60 ring-1 ring-rose-500/30'
@@ -90,7 +95,7 @@ export const RoundRecapModal: React.FC<RoundRecapModalProps> = ({
                   <div>
                     <div className="font-bold text-xs sm:text-sm text-slate-100 flex items-center gap-1.5">
                       <span>{player.name}</span>
-                      {player.playerId === 0 && (
+                      {player.playerId === userSeat && (
                         <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 px-1.5 py-0.2 rounded font-sans">
                           Tu
                         </span>
@@ -130,6 +135,18 @@ export const RoundRecapModal: React.FC<RoundRecapModalProps> = ({
 
         {/* Action Controls */}
         <div className="flex flex-col sm:flex-row gap-2 pt-2 border-t border-emerald-900/60">
+          {onLeaveTable && (
+            <button
+              type="button"
+              onClick={onLeaveTable}
+              className="py-2.5 px-3 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-500/40 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
+              title="Părăsește masa de joc"
+            >
+              <LogOut className="w-4 h-4 text-red-400" />
+              <span className="hidden sm:inline">Părăsește Masa</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onOpenScoreTable}

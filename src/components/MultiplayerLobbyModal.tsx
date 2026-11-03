@@ -25,11 +25,13 @@ import {
   RefreshCw,
   AlertCircle,
   Loader2,
+  User,
 } from 'lucide-react';
 
 interface MultiplayerLobbyModalProps {
   currentUserId: string;
   currentUserName: string;
+  onUpdateUserName?: (name: string) => void;
   onStartRoomGame: (room: RoomSyncState, mySeat: number) => void;
   onClose: () => void;
 }
@@ -37,6 +39,7 @@ interface MultiplayerLobbyModalProps {
 export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
   currentUserId,
   currentUserName,
+  onUpdateUserName,
   onStartRoomGame,
   onClose,
 }) => {
@@ -272,6 +275,26 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
           <div className="px-4 py-2 bg-red-950/80 border-b border-red-500/50 text-red-300 text-xs flex items-center gap-2">
             <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
             <span>{errorMessage}</span>
+          </div>
+        )}
+
+        {/* Player Name Profile Bar */}
+        {activeTab !== 'in_room' && (
+          <div className="px-4 py-2 bg-slate-950/90 border-b border-emerald-900/60 flex items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2">
+              <User className="w-4 h-4 text-amber-400" />
+              <span className="text-slate-300 font-semibold">Numele Tău la Masă:</span>
+            </div>
+            <div className="flex-1 max-w-xs">
+              <input
+                type="text"
+                value={currentUserName}
+                onChange={(e) => onUpdateUserName?.(e.target.value)}
+                placeholder="Numele tău..."
+                maxLength={16}
+                className="w-full px-2.5 py-1 bg-slate-900 border border-amber-500/40 rounded-lg text-white font-bold text-xs focus:outline-hidden focus:border-amber-400"
+              />
+            </div>
           </div>
         )}
 

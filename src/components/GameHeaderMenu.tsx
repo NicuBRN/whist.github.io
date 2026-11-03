@@ -18,6 +18,7 @@ import {
   Download,
   Shield,
   Globe,
+  LogOut,
 } from 'lucide-react';
 
 interface GameHeaderMenuProps {
@@ -34,6 +35,7 @@ interface GameHeaderMenuProps {
   onOpenRules: () => void;
   onRestartGame: () => void;
   onDownloadStandalone: () => void;
+  onLeaveTable?: () => void;
 }
 
 export const GameHeaderMenu: React.FC<GameHeaderMenuProps> = ({
@@ -50,6 +52,7 @@ export const GameHeaderMenu: React.FC<GameHeaderMenuProps> = ({
   onOpenRules,
   onRestartGame,
   onDownloadStandalone,
+  onLeaveTable,
 }) => {
   const [isOpen, setIsOpen] = useState<boolean>(false);
 
@@ -216,15 +219,26 @@ export const GameHeaderMenu: React.FC<GameHeaderMenuProps> = ({
               </button>
 
               {/* Restart Game */}
-              <div className="pt-1 border-t border-slate-800">
+              <div className="pt-1 border-t border-slate-800 space-y-1">
                 <button
                   type="button"
                   onClick={() => handleAction(onRestartGame)}
-                  className="w-full px-3 py-2 rounded-xl bg-slate-900 hover:bg-red-950/60 text-slate-300 hover:text-red-300 border border-slate-800 hover:border-red-500/40 text-xs sm:text-sm font-semibold flex items-center gap-2.5 cursor-pointer transition-colors"
+                  className="w-full px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 text-xs sm:text-sm font-semibold flex items-center gap-2.5 cursor-pointer transition-colors"
                 >
                   <RotateCcw className="w-4 h-4 text-amber-400" />
                   <span>Joc Nou (Reîncepe meciul)</span>
                 </button>
+
+                {onLeaveTable && (
+                  <button
+                    type="button"
+                    onClick={() => handleAction(onLeaveTable)}
+                    className="w-full px-3 py-2 rounded-xl bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-500/40 text-xs sm:text-sm font-semibold flex items-center gap-2.5 cursor-pointer transition-colors"
+                  >
+                    <LogOut className="w-4 h-4 text-red-400" />
+                    <span>Părăsește Masa de Joc</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
