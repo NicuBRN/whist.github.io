@@ -8,6 +8,7 @@ import {
   RoomSyncState,
   RoomListing,
   multiplayerService,
+  normalizeRoomCode,
 } from '../utils/multiplayer.ts';
 import {
   X,
@@ -181,12 +182,11 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
   // Direct room code join handler
   const handleDirectCodeJoin = async (e: React.FormEvent) => {
     e.preventDefault();
-    const clean = manualRoomCode.trim().toUpperCase();
-    if (!clean) {
+    const code = normalizeRoomCode(manualRoomCode);
+    if (!code) {
       setErrorMessage('Introduceți codul mesei (ex: WHIST-1234 sau 1234).');
       return;
     }
-    const code = clean.startsWith('WHIST-') ? clean : `WHIST-${clean}`;
     setErrorMessage('');
     setIsSubmitting(true);
     try {

@@ -8,6 +8,7 @@ import {
   collection,
   setDoc,
   getDoc,
+  getDocs,
   updateDoc,
   deleteDoc,
   onSnapshot,
@@ -16,6 +17,28 @@ import {
   Unsubscribe,
 } from 'firebase/firestore';
 import { db } from '../firebase.ts';
+
+/**
+ * Remove undefined properties recursively so Firestore does not reject with invalid-argument error
+ */
+export function cleanForFirestore<T>(data: T): T {
+  if (data === null || data === undefined) return data;
+  if (Array.isArray(data)) {
+    return data
+      .filter((item) => item !== undefined)
+      .map((item) => cleanForFirestore(item)) as unknown as T;
+  }
+  if (typeof data === 'object') {
+    const res: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(data as Record<string, unknown>)) {
+      if (val !== undefined) {
+        res[key] = cleanForFirestore(val);
+      }
+    }
+    return res as T;
+  }
+  return data;
+}
 import {
   GameModeType,
   Card,
@@ -113,9 +136,12 @@ export interface RoomStatePayload {
 }
 
 export function normalizeRoomCode(code: string): string {
-  const clean = code.trim().toUpperCase();
+  if (!code) return '';
+  let clean = code.trim().toUpperCase();
+  clean = clean.replace(/^[#\s]+/, '');
+  clean = clean.replace(/^WHIST[\s\-_:]*/i, '');
   if (!clean) return '';
-  return clean.startsWith('WHIST-') ? clean : `WHIST-${clean}`;
+  return `WHIST-${clean}`;
 }
 
 type RoomsListListener = (rooms: RoomListing[]) => void;
@@ -215,7 +241,32 @@ class RealtimeMultiplayerService {
   }
 
   public async fetchInitialRooms(): Promise<RoomListing[]> {
-    return this.cachedRooms;
+    try {
+      const snap = await getDocs(query(collection(db, 'rooms'), limit(50)));
+      const list: RoomListing[] = [];
+      snap.forEach((docSnap) => {
+        const data = docSnap.data() as Partial<RoomSyncState>;
+        if (data && data.roomId) {
+          list.push({
+            id: data.roomId,
+            name: data.roomName || 'Masă Whist',
+            hasPassword: !!data.hasPassword,
+            hostId: data.hostId || '',
+            playerCount: Array.isArray(data.players) ? data.players.length : 1,
+            maxPlayers: data.maxPlayers || 4,
+            status: data.status || 'lobby',
+            updatedAt: data.updatedAt || Date.now(),
+          });
+        }
+      });
+      list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      this.cachedRooms = list;
+      this.roomsListListeners.forEach((l) => l(list));
+      return list;
+    } catch (err) {
+      console.warn('fetchInitialRooms error:', err);
+      return this.cachedRooms;
+    }
   }
 
   // Fetch Room Info by code
@@ -306,10 +357,12 @@ class RealtimeMultiplayerService {
 
     // Save to Firestore
     try {
-      await setDoc(doc(db, 'rooms', roomId), newRoom);
+      const cleanData = cleanForFirestore(newRoom);
+      await setDoc(doc(db, 'rooms', roomId), cleanData);
       this.subscribeActiveRoom(roomId, 0);
     } catch (e) {
-      console.warn('Error saving room to Firestore:', e);
+      console.error('Error saving room to Firestore:', e);
+      throw new Error('Eroare la salvarea camerei pe server! Vă rugăm să reîncercați.');
     }
 
     return payload;
@@ -365,10 +418,10 @@ class RealtimeMultiplayerService {
 
         room.players.push(newPlayer);
         room.updatedAt = Date.now();
-        await updateDoc(roomRef, {
+        await updateDoc(roomRef, cleanForFirestore({
           players: room.players,
           updatedAt: room.updatedAt,
-        });
+        }));
       }
 
       const payload: RoomStatePayload = {
@@ -385,7 +438,8 @@ class RealtimeMultiplayerService {
       this.subscribeActiveRoom(roomId, seatIndex);
 
       return { success: true, payload };
-    } catch {
+    } catch (err) {
+      console.error('joinRoom error:', err);
       return { success: false, error: 'Eroare de conexiune la server!' };
     }
   }
@@ -583,10 +637,10 @@ class RealtimeMultiplayerService {
       tricksWon: 0,
     });
     room.updatedAt = Date.now();
-    await updateDoc(doc(db, 'rooms', roomId), {
+    await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({
       players: room.players,
       updatedAt: room.updatedAt,
-    });
+    }));
   }
 
   public async toggleReady(roomId: string, playerId: string) {
@@ -597,10 +651,10 @@ class RealtimeMultiplayerService {
       p.id === playerId ? { ...p, isReady: !p.isReady } : p
     );
     room.updatedAt = Date.now();
-    await updateDoc(doc(db, 'rooms', roomId), {
+    await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({
       players: room.players,
       updatedAt: room.updatedAt,
-    });
+    }));
   }
 
   public async startRoomGame(roomId: string) {
@@ -651,9 +705,9 @@ class RealtimeMultiplayerService {
         if (a.suit !== b.suit) return a.suit.localeCompare(b.suit);
         return b.rank - a.rank;
       });
-      await setDoc(doc(db, 'rooms', roomId, 'hands', String(i)), {
+      await setDoc(doc(db, 'rooms', roomId, 'hands', String(i)), cleanForFirestore({
         cards: hands[i],
-      });
+      }));
     }
 
     room.roundsCount = rounds.length;
@@ -675,9 +729,9 @@ class RealtimeMultiplayerService {
     room.statusMessage = 'Runda 1. Analizează cărțile! Licitația începe în 5 secunde.';
     room.updatedAt = Date.now();
 
-    await updateDoc(doc(db, 'rooms', roomId), {
+    await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({
       ...room,
-    });
+    }));
   }
 
   public async startBidding(roomId: string) {
@@ -695,12 +749,12 @@ class RealtimeMultiplayerService {
     }.`;
     room.updatedAt = Date.now();
 
-    await updateDoc(doc(db, 'rooms', roomId), {
+    await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({
       phase: room.phase,
       currentTurn: room.currentTurn,
       statusMessage: room.statusMessage,
       updatedAt: room.updatedAt,
-    });
+    }));
   }
 
   public async placeBid(roomId: string, seatIndex: number, bid: number) {
@@ -724,13 +778,13 @@ class RealtimeMultiplayerService {
     }
     room.updatedAt = Date.now();
 
-    await updateDoc(doc(db, 'rooms', roomId), {
+    await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({
       players: room.players,
       phase: room.phase,
       currentTurn: room.currentTurn,
       statusMessage: room.statusMessage,
       updatedAt: room.updatedAt,
-    });
+    }));
   }
 
   public async playCard(roomId: string, seatIndex: number, card: Card) {
@@ -744,7 +798,7 @@ class RealtimeMultiplayerService {
     const handSnap = await getDoc(handRef);
     if (handSnap.exists()) {
       const cards = ((handSnap.data().cards as Card[]) || []).filter((c) => c.id !== card.id);
-      await updateDoc(handRef, { cards });
+      await updateDoc(handRef, cleanForFirestore({ cards }));
     }
 
     // 2. Add to trick
@@ -775,7 +829,7 @@ class RealtimeMultiplayerService {
       };
       room.statusMessage = `${winnerPlayer.name} a luat cupa!`;
       room.updatedAt = Date.now();
-      await updateDoc(doc(db, 'rooms', roomId), { ...room });
+      await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...room }));
 
       // After 1.6s evaluate next trick or end round
       setTimeout(async () => {
@@ -821,7 +875,7 @@ class RealtimeMultiplayerService {
           fresh.trickWinnerBanner = null;
           fresh.statusMessage = `Runda ${fresh.currentRoundIdx + 1} s-a încheiat!`;
           fresh.updatedAt = Date.now();
-          await updateDoc(doc(db, 'rooms', roomId), { ...fresh });
+          await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...fresh }));
         } else {
           // Next trick
           fresh.phase = 'playing';
@@ -831,19 +885,19 @@ class RealtimeMultiplayerService {
           fresh.currentTurn = winnerSeat;
           fresh.statusMessage = `Cupa nouă. Conduce ${winnerPlayer.name}.`;
           fresh.updatedAt = Date.now();
-          await updateDoc(doc(db, 'rooms', roomId), { ...fresh });
+          await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...fresh }));
         }
       }, 1600);
     } else {
       room.currentTurn = (room.currentTurn + 1) % room.players.length;
       room.statusMessage = `Rândul lui ${room.players[room.currentTurn].name}.`;
       room.updatedAt = Date.now();
-      await updateDoc(doc(db, 'rooms', roomId), {
+      await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({
         currentTrick: room.currentTrick,
         currentTurn: room.currentTurn,
         statusMessage: room.statusMessage,
         updatedAt: room.updatedAt,
-      });
+      }));
     }
   }
 
@@ -860,7 +914,7 @@ class RealtimeMultiplayerService {
       room.status = 'game_over';
       room.statusMessage = 'Joc terminat!';
       room.updatedAt = Date.now();
-      await updateDoc(doc(db, 'rooms', roomId), { ...room });
+      await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...room }));
       return;
     }
 
@@ -888,9 +942,9 @@ class RealtimeMultiplayerService {
         if (a.suit !== b.suit) return a.suit.localeCompare(b.suit);
         return b.rank - a.rank;
       });
-      await setDoc(doc(db, 'rooms', roomId, 'hands', String(i)), {
+      await setDoc(doc(db, 'rooms', roomId, 'hands', String(i)), cleanForFirestore({
         cards: hands[i],
-      });
+      }));
     }
 
     room.players.forEach((p) => {
@@ -915,7 +969,7 @@ class RealtimeMultiplayerService {
     room.statusMessage = `Runda ${nextIdx + 1} (${nextRoundConfig.cardCount} cărți). Analizează cărțile!`;
     room.updatedAt = Date.now();
 
-    await updateDoc(doc(db, 'rooms', roomId), { ...room });
+    await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...room }));
   }
 
   public async leaveRoom(roomId: string, playerId: string) {
@@ -948,11 +1002,11 @@ class RealtimeMultiplayerService {
           room.hostId = room.players[0].id;
         }
         room.updatedAt = Date.now();
-        await updateDoc(doc(db, 'rooms', roomId), {
+        await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({
           players: room.players,
           hostId: room.hostId,
           updatedAt: room.updatedAt,
-        });
+        }));
       }
     } catch {
       // Ignored
