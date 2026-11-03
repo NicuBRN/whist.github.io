@@ -43,6 +43,7 @@ import {
   GameModeType,
   Card,
   Suit,
+  Rank,
   createDeck,
   shuffleDeck,
   generateRounds,
@@ -165,6 +166,7 @@ class RealtimeMultiplayerService {
   private roomsListUnsub: Unsubscribe | null = null;
   private scheduledTurnKey: string | null = null;
   private aiTurnTimeout: ReturnType<typeof setTimeout> | null = null;
+  private watchdogInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -456,6 +458,10 @@ class RealtimeMultiplayerService {
       this.handDocUnsub();
       this.handDocUnsub = null;
     }
+    if (this.watchdogInterval) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
+    }
 
     // 1. Listen to Room state
     this.roomDocUnsub = onSnapshot(doc(db, 'rooms', roomId), (snap) => {
@@ -532,90 +538,202 @@ class RealtimeMultiplayerService {
         }
       }
     );
+
+    // 3. Resilient Watchdog ticker: recovers stalled AI turns or backgrounded tabs
+    this.watchdogInterval = setInterval(() => {
+      this.runWatchdogTick();
+    }, 1000);
   }
 
-  // Check and process AI turns automatically by host
+  // Periodic Watchdog to prevent state freezes across tabs and network delays
+  private async runWatchdogTick() {
+    if (!this.cachedRoomState) return;
+    const room = this.cachedRoomState.room;
+    if (!room || room.status !== 'playing') return;
+
+    const now = Date.now();
+    const timeSinceUpdate = now - (room.updatedAt || 0);
+
+    // 1. Inspecting phase timeout (if > 6s has passed and still inspecting)
+    if (room.phase === 'inspecting' && timeSinceUpdate > 6000) {
+      await this.startBidding(room.roomId);
+      return;
+    }
+
+    // 2. Trick evaluation phase timeout (if > 2.5s has passed and still in trick_eval)
+    if (room.phase === 'trick_eval' && timeSinceUpdate > 2500) {
+      await this.finalizeTrickEval(room.roomId);
+      return;
+    }
+
+    // 3. AI turn watchdog (if in bidding or playing, current player is AI, and > 1800ms has elapsed)
+    const currentPlayer = room.players[room.currentTurn];
+    if (currentPlayer && currentPlayer.isAi && timeSinceUpdate > 1800) {
+      await this.executeAiTurnNow(room, currentPlayer.seatIndex);
+    }
+  }
+
+  // Check and process AI turns automatically by host (with fallback if host disconnects or sleeps)
   private async checkAndProcessAiTurn(room: RoomSyncState) {
-    if (this.isProcessingAi) return;
     if (room.status !== 'playing') return;
-    if (room.hostId !== this.activePlayerId) return;
+
+    // Auto-advance inspecting phase after 5s (host) or 6.5s (fallback)
+    if (room.phase === 'inspecting') {
+      const isHost = room.hostId === this.activePlayerId;
+      const key = `${room.roomId}-inspecting-${room.currentRoundIdx}`;
+      if (this.scheduledTurnKey !== key) {
+        this.scheduledTurnKey = key;
+        const delay = isHost ? 5000 : 6500;
+        if (this.aiTurnTimeout) clearTimeout(this.aiTurnTimeout);
+        this.aiTurnTimeout = setTimeout(async () => {
+          try {
+            const fresh = this.cachedRoomState?.room?.roomId === room.roomId
+              ? this.cachedRoomState.room
+              : ((await getDoc(doc(db, 'rooms', room.roomId))).data() as RoomSyncState | undefined);
+            if (fresh && fresh.phase === 'inspecting' && fresh.currentRoundIdx === room.currentRoundIdx) {
+              await this.startBidding(room.roomId);
+            }
+          } catch (e) {
+            console.warn('Auto startBidding warning:', e);
+          } finally {
+            if (this.scheduledTurnKey === key) this.scheduledTurnKey = null;
+          }
+        }, delay);
+      }
+      return;
+    }
 
     const currentPlayer = room.players[room.currentTurn];
+    if (!currentPlayer || !currentPlayer.isAi) {
+      if (this.aiTurnTimeout) {
+        clearTimeout(this.aiTurnTimeout);
+        this.aiTurnTimeout = null;
+      }
+      this.scheduledTurnKey = null;
+      return;
+    }
+
+    // If player already placed a bid in bidding phase, nothing to do
+    if (room.phase === 'bidding' && currentPlayer.bid !== null && currentPlayer.bid !== undefined) {
+      if (this.aiTurnTimeout) {
+        clearTimeout(this.aiTurnTimeout);
+        this.aiTurnTimeout = null;
+      }
+      this.scheduledTurnKey = null;
+      return;
+    }
+
+    const turnKey = `${room.roomId}-${room.phase}-${room.currentRoundIdx}-${room.currentTurn}`;
+    if (this.scheduledTurnKey === turnKey) {
+      // Already scheduled for this exact turn
+      return;
+    }
+
+    this.scheduledTurnKey = turnKey;
+    if (this.aiTurnTimeout) {
+      clearTimeout(this.aiTurnTimeout);
+      this.aiTurnTimeout = null;
+    }
+
+    const isHost = room.hostId === this.activePlayerId;
+    const delay = isHost ? 450 : 1000;
+
+    this.aiTurnTimeout = setTimeout(async () => {
+      try {
+        await this.executeAiTurnNow(room, currentPlayer.seatIndex);
+      } catch (err) {
+        console.warn('checkAndProcessAiTurn error:', err);
+      } finally {
+        if (this.scheduledTurnKey === turnKey) {
+          this.scheduledTurnKey = null;
+        }
+      }
+    }, delay);
+  }
+
+  // Executes an AI turn immediately, safely reading freshest state
+  private async executeAiTurnNow(room: RoomSyncState, seatIndex: number) {
+    const latestRoom = this.cachedRoomState?.room?.roomId === room.roomId
+      ? this.cachedRoomState.room
+      : ((await getDoc(doc(db, 'rooms', room.roomId))).data() as RoomSyncState | undefined);
+
+    if (!latestRoom || latestRoom.status !== 'playing') return;
+    if (latestRoom.currentTurn !== seatIndex) return;
+
+    const currentPlayer = latestRoom.players[seatIndex];
     if (!currentPlayer || !currentPlayer.isAi) return;
 
-    this.isProcessingAi = true;
-    try {
-      if (room.phase === 'inspecting') {
-        // Auto-advance after 5s or host trigger
-      } else if (room.phase === 'bidding') {
-        setTimeout(async () => {
-          if (!this.cachedRoomState || this.cachedRoomState.room.phase !== 'bidding') return;
-          const freshRoom = this.cachedRoomState.room;
-          if (freshRoom.currentTurn !== currentPlayer.seatIndex) return;
+    if (latestRoom.phase === 'bidding') {
+      if (currentPlayer.bid !== null && currentPlayer.bid !== undefined) return;
+      const round = latestRoom.currentRound;
+      if (!round) return;
 
-          // Fetch AI's hand to compute bid
-          const handSnap = await getDoc(
-            doc(db, 'rooms', room.roomId, 'hands', String(currentPlayer.seatIndex))
-          );
-          const aiHand = handSnap.exists() ? (handSnap.data().cards as Card[]) || [] : [];
-          const round = freshRoom.currentRound;
-          if (!round) return;
-
-          const isDealer = round.dealerIndex === currentPlayer.seatIndex;
-          const forbidden = isDealer
-            ? getForbiddenBid(
-                freshRoom.players.map((p) => p.bid ?? null),
-                round.cardCount,
-                round.dealerIndex,
-                currentPlayer.seatIndex
-              )
-            : -1;
-
-          const aiBid = calculateAIBid(
-            aiHand,
-            freshRoom.trumpSuit,
-            round.cardCount,
-            freshRoom.players.map((p) => p.bid ?? null),
-            round.dealerIndex,
-            currentPlayer.seatIndex
-          );
-
-          await this.placeBid(room.roomId, currentPlayer.seatIndex, aiBid);
-        }, 800);
-      } else if (room.phase === 'playing') {
-        setTimeout(async () => {
-          if (!this.cachedRoomState || this.cachedRoomState.room.phase !== 'playing') return;
-          const freshRoom = this.cachedRoomState.room;
-          if (freshRoom.currentTurn !== currentPlayer.seatIndex) return;
-
-          const handSnap = await getDoc(
-            doc(db, 'rooms', room.roomId, 'hands', String(currentPlayer.seatIndex))
-          );
-          const aiHand = handSnap.exists() ? (handSnap.data().cards as Card[]) || [] : [];
-          if (aiHand.length === 0) return;
-
-          const trickForRules = freshRoom.currentTrick.map((t) => ({
-            playerId: t.playerId,
-            card: t.card,
-          }));
-          const legal = getLegalCards(aiHand, trickForRules, freshRoom.trumpSuit, true);
-
-          const chosenCard = selectAICard(
-            legal,
-            trickForRules,
-            freshRoom.trumpSuit,
-            currentPlayer.bid ?? 0,
-            currentPlayer.tricksWon ?? 0,
-            aiHand.length
-          );
-
-          await this.playCard(room.roomId, currentPlayer.seatIndex, chosenCard);
-        }, 800);
+      // 1. Get AI hand (prefer latestRoom.aiHands, fallback to subcollection, fallback to synthetic hand)
+      let aiHand: Card[] = (latestRoom.aiHands && latestRoom.aiHands[String(seatIndex)]) || [];
+      if (!aiHand || aiHand.length === 0) {
+        try {
+          const handSnap = await getDoc(doc(db, 'rooms', latestRoom.roomId, 'hands', String(seatIndex)));
+          if (handSnap.exists()) {
+            aiHand = (handSnap.data().cards as Card[]) || [];
+          }
+        } catch (e) {
+          console.warn('Could not read AI hand subcollection:', e);
+        }
       }
-    } finally {
-      setTimeout(() => {
-        this.isProcessingAi = false;
-      }, 1000);
+
+      // If hand is still empty (e.g. edge case in legacy room), synthesize plausible cards
+      if (!aiHand || aiHand.length === 0) {
+        aiHand = Array.from({ length: round.cardCount }, (_, i) => ({
+          id: `card-${seatIndex}-${i}`,
+          suit: (latestRoom.trumpSuit || 'SPADES') as Suit,
+          rank: (9 + (i % 5)) as Rank,
+        }));
+      }
+
+      const aiBid = calculateAIBid(
+        aiHand,
+        latestRoom.trumpSuit,
+        round.cardCount,
+        latestRoom.players.map((p) => p.bid ?? null),
+        round.dealerIndex,
+        seatIndex
+      );
+
+      await this.placeBid(latestRoom.roomId, seatIndex, aiBid);
+    } else if (latestRoom.phase === 'playing') {
+      // 1. Get AI hand
+      let aiHand: Card[] = (latestRoom.aiHands && latestRoom.aiHands[String(seatIndex)]) || [];
+      if (!aiHand || aiHand.length === 0) {
+        try {
+          const handSnap = await getDoc(doc(db, 'rooms', latestRoom.roomId, 'hands', String(seatIndex)));
+          if (handSnap.exists()) {
+            aiHand = (handSnap.data().cards as Card[]) || [];
+          }
+        } catch (e) {
+          console.warn('Could not read AI hand subcollection for play:', e);
+        }
+      }
+
+      if (!aiHand || aiHand.length === 0) {
+        console.warn('AI hand empty for seat in playing phase', seatIndex);
+        return;
+      }
+
+      const trickForRules = latestRoom.currentTrick.map((t) => ({
+        playerId: t.playerId,
+        card: t.card,
+      }));
+      const legal = getLegalCards(aiHand, trickForRules, latestRoom.trumpSuit, true);
+      const chosenCard = selectAICard(
+        legal,
+        trickForRules,
+        latestRoom.trumpSuit,
+        currentPlayer.bid ?? 0,
+        currentPlayer.tricksWon ?? 0,
+        aiHand.length
+      );
+
+      await this.playCard(latestRoom.roomId, seatIndex, chosenCard);
     }
   }
 
@@ -701,6 +819,7 @@ class RealtimeMultiplayerService {
       }
     }
 
+    const aiHandsMap: Record<string, Card[]> = {};
     for (let i = 0; i < count; i++) {
       // Sort cards
       hands[i].sort((a, b) => {
@@ -710,7 +829,11 @@ class RealtimeMultiplayerService {
       await setDoc(doc(db, 'rooms', roomId, 'hands', String(i)), cleanForFirestore({
         cards: hands[i],
       }));
+      if (room.players[i]?.isAi) {
+        aiHandsMap[String(i)] = hands[i];
+      }
     }
+    room.aiHands = aiHandsMap;
 
     room.roundsCount = rounds.length;
     room.currentRoundIdx = 0;
@@ -765,6 +888,14 @@ class RealtimeMultiplayerService {
     const room = roomSnap.data() as RoomSyncState;
     if (room.phase !== 'bidding') return;
 
+    // Concurrency / Duplicate guard:
+    if (room.players[seatIndex].bid !== null && room.players[seatIndex].bid !== undefined) {
+      return;
+    }
+    if (room.currentTurn !== seatIndex) {
+      return;
+    }
+
     room.players[seatIndex].bid = bid;
     const allBidded = room.players.every((p) => p.bid !== null && p.bid !== undefined);
 
@@ -775,7 +906,7 @@ class RealtimeMultiplayerService {
       room.currentTurn = firstLeader;
       room.statusMessage = `Licitație încheiată! ${room.players[firstLeader].name} conduce prima cupă.`;
     } else {
-      room.currentTurn = (room.currentTurn + 1) % room.players.length;
+      room.currentTurn = (seatIndex + 1) % room.players.length;
       room.statusMessage = `Rândul lui ${room.players[room.currentTurn].name} să liciteze.`;
     }
     room.updatedAt = Date.now();
@@ -794,13 +925,21 @@ class RealtimeMultiplayerService {
     if (!roomSnap.exists()) return;
     const room = roomSnap.data() as RoomSyncState;
     if (room.phase !== 'playing') return;
+    if (room.currentTurn !== seatIndex) return;
 
-    // 1. Remove card from player hand in subcollection
+    // 1. Remove card from player hand in subcollection and aiHands
     const handRef = doc(db, 'rooms', roomId, 'hands', String(seatIndex));
-    const handSnap = await getDoc(handRef);
-    if (handSnap.exists()) {
-      const cards = ((handSnap.data().cards as Card[]) || []).filter((c) => c.id !== card.id);
-      await updateDoc(handRef, cleanForFirestore({ cards }));
+    try {
+      const handSnap = await getDoc(handRef);
+      if (handSnap.exists()) {
+        const cards = ((handSnap.data().cards as Card[]) || []).filter((c) => c.id !== card.id);
+        await updateDoc(handRef, cleanForFirestore({ cards }));
+      }
+    } catch (e) {
+      console.warn('Error updating hand doc:', e);
+    }
+    if (room.aiHands && room.aiHands[String(seatIndex)]) {
+      room.aiHands[String(seatIndex)] = room.aiHands[String(seatIndex)].filter((c) => c.id !== card.id);
     }
 
     // 2. Add to trick
@@ -812,7 +951,7 @@ class RealtimeMultiplayerService {
     });
 
     if (room.currentTrick.length === room.players.length) {
-      // Trick complete
+      // Trick is full: strictly transition to 'trick_eval'
       room.phase = 'trick_eval';
       const trickForRules = room.currentTrick.map((t) => ({
         playerId: t.playerId,
@@ -833,73 +972,87 @@ class RealtimeMultiplayerService {
       room.updatedAt = Date.now();
       await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...room }));
 
-      // After 1.6s evaluate next trick or end round
-      setTimeout(async () => {
-        const freshSnap = await getDoc(doc(db, 'rooms', roomId));
-        if (!freshSnap.exists()) return;
-        const fresh = freshSnap.data() as RoomSyncState;
-
-        // Check if hand is empty
-        const remainingHandSnap = await getDoc(
-          doc(db, 'rooms', roomId, 'hands', String(winnerSeat))
-        );
-        const remCards = remainingHandSnap.exists()
-          ? (remainingHandSnap.data().cards as Card[]) || []
-          : [];
-
-        if (remCards.length === 0) {
-          // Round finished! Finalize scores
-          const recapList = fresh.players.map((p) => {
-            const pts = calculateRoundPoints(p.bid ?? 0, p.tricksWon || 0);
-            return {
-              bid: p.bid ?? 0,
-              tricksWon: p.tricksWon || 0,
-              points: pts,
-              runningTotal: p.score + pts,
-            };
-          });
-
-          fresh.players.forEach((p, idx) => {
-            p.score = recapList[idx].runningTotal;
-          });
-
-          fresh.history = fresh.history || [];
-          fresh.history.push({
-            roundNumber: fresh.currentRoundIdx + 1,
-            cardCount: fresh.currentRound?.cardCount || 1,
-            trumpSuit: fresh.trumpSuit,
-            playerResults: recapList,
-          });
-
-          fresh.phase = 'round_recap';
-          fresh.currentTrick = [];
-          fresh.winningCardId = null;
-          fresh.trickWinnerBanner = null;
-          fresh.statusMessage = `Runda ${fresh.currentRoundIdx + 1} s-a încheiat!`;
-          fresh.updatedAt = Date.now();
-          await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...fresh }));
-        } else {
-          // Next trick
-          fresh.phase = 'playing';
-          fresh.currentTrick = [];
-          fresh.winningCardId = null;
-          fresh.trickWinnerBanner = null;
-          fresh.currentTurn = winnerSeat;
-          fresh.statusMessage = `Cupa nouă. Conduce ${winnerPlayer.name}.`;
-          fresh.updatedAt = Date.now();
-          await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...fresh }));
-        }
-      }, 1600);
+      // Schedule trick finalization after 1.8s visual display
+      setTimeout(() => {
+        this.finalizeTrickEval(roomId);
+      }, 1800);
     } else {
-      room.currentTurn = (room.currentTurn + 1) % room.players.length;
+      room.currentTurn = (seatIndex + 1) % room.players.length;
       room.statusMessage = `Rândul lui ${room.players[room.currentTurn].name}.`;
       room.updatedAt = Date.now();
       await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({
         currentTrick: room.currentTrick,
         currentTurn: room.currentTurn,
         statusMessage: room.statusMessage,
+        aiHands: room.aiHands,
         updatedAt: room.updatedAt,
       }));
+    }
+  }
+
+  // Finalizes trick evaluation safely (deterministic and callable by timer or watchdog)
+  public async finalizeTrickEval(roomId: string) {
+    const freshSnap = await getDoc(doc(db, 'rooms', roomId));
+    if (!freshSnap.exists()) return;
+    const fresh = freshSnap.data() as RoomSyncState;
+    if (fresh.phase !== 'trick_eval') return;
+
+    // Deterministic check: compare total tricks won in this round with round card count
+    const totalTricksWon = fresh.players.reduce((sum, p) => sum + (p.tricksWon || 0), 0);
+    const roundCardCount = fresh.currentRound?.cardCount || 1;
+
+    let winnerSeat = 0;
+    let winnerPlayer = fresh.players[0];
+    if (fresh.currentTrick && fresh.currentTrick.length > 0) {
+      const evalResult = evaluateTrickWinner(
+        fresh.currentTrick.map((t) => ({ playerId: t.playerId, card: t.card })),
+        fresh.trumpSuit
+      );
+      winnerSeat = evalResult.winnerPlayerId;
+      winnerPlayer = fresh.players[winnerSeat];
+    }
+
+    if (totalTricksWon >= roundCardCount) {
+      // Round finished! Finalize scores
+      const recapList = fresh.players.map((p) => {
+        const pts = calculateRoundPoints(p.bid ?? 0, p.tricksWon || 0);
+        return {
+          bid: p.bid ?? 0,
+          tricksWon: p.tricksWon || 0,
+          points: pts,
+          runningTotal: p.score + pts,
+        };
+      });
+
+      fresh.players.forEach((p, idx) => {
+        p.score = recapList[idx].runningTotal;
+      });
+
+      fresh.history = fresh.history || [];
+      fresh.history.push({
+        roundNumber: fresh.currentRoundIdx + 1,
+        cardCount: roundCardCount,
+        trumpSuit: fresh.trumpSuit,
+        playerResults: recapList,
+      });
+
+      fresh.phase = 'round_recap';
+      fresh.currentTrick = [];
+      fresh.winningCardId = null;
+      fresh.trickWinnerBanner = null;
+      fresh.statusMessage = `Runda ${fresh.currentRoundIdx + 1} s-a încheiat!`;
+      fresh.updatedAt = Date.now();
+      await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...fresh }));
+    } else {
+      // Next trick
+      fresh.phase = 'playing';
+      fresh.currentTrick = [];
+      fresh.winningCardId = null;
+      fresh.trickWinnerBanner = null;
+      fresh.currentTurn = winnerSeat;
+      fresh.statusMessage = `Cupa nouă. Conduce ${winnerPlayer?.name || 'Jucătorul'}.`;
+      fresh.updatedAt = Date.now();
+      await updateDoc(doc(db, 'rooms', roomId), cleanForFirestore({ ...fresh }));
     }
   }
 
@@ -939,6 +1092,7 @@ class RealtimeMultiplayerService {
       }
     }
 
+    const aiHandsMap: Record<string, Card[]> = {};
     for (let i = 0; i < count; i++) {
       hands[i].sort((a, b) => {
         if (a.suit !== b.suit) return a.suit.localeCompare(b.suit);
@@ -947,7 +1101,11 @@ class RealtimeMultiplayerService {
       await setDoc(doc(db, 'rooms', roomId, 'hands', String(i)), cleanForFirestore({
         cards: hands[i],
       }));
+      if (room.players[i]?.isAi) {
+        aiHandsMap[String(i)] = hands[i];
+      }
     }
+    room.aiHands = aiHandsMap;
 
     room.players.forEach((p) => {
       p.bid = null;
@@ -983,6 +1141,16 @@ class RealtimeMultiplayerService {
       this.handDocUnsub();
       this.handDocUnsub = null;
     }
+
+    if (this.aiTurnTimeout) {
+      clearTimeout(this.aiTurnTimeout);
+      this.aiTurnTimeout = null;
+    }
+    if (this.watchdogInterval) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
+    }
+    this.scheduledTurnKey = null;
 
     this.activeRoomId = null;
     this.cachedRoomState = null;

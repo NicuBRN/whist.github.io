@@ -200,6 +200,9 @@ export default function App() {
         setShowLobbyModal(false);
         setGameState('playing');
         setPlayerCount(data.room.players.length);
+        setRounds((prev) =>
+          prev.length === 0 ? generateRounds(data.room.players.length) : prev
+        );
         setRoundPhase(data.room.phase);
         setCurrentTurn(data.room.currentTurn);
         if (data.room.currentTurn === data.mySeat && data.room.phase === 'playing') {
@@ -212,6 +215,14 @@ export default function App() {
           setTrumpCard(null);
           setTrumpSuit(null);
         }
+        // Sync current trick so cards on table are visible to all players
+        setCurrentTrick(
+          (data.room.currentTrick || []).map((t) => ({
+            playerId: t.playerId,
+            card: t.card,
+            playerName: t.playerName,
+          }))
+        );
         if (data.room.trickWinnerBanner) {
           setTrickWinnerBanner(data.room.trickWinnerBanner);
           setWinningCardId(data.room.winningCardId || null);
@@ -236,6 +247,47 @@ export default function App() {
         }));
         setPlayers(mappedPlayers);
         playersRef.current = mappedPlayers;
+
+        // Sync round recap modal when phase is round_recap
+        if (data.room.phase === 'round_recap') {
+          const lastHistory = data.room.history?.[data.room.history.length - 1];
+          if (lastHistory) {
+            const mappedResults: PlayerRoundResult[] = lastHistory.playerResults.map((pr, idx) => {
+              const player = data.room.players[idx];
+              const prevScore = pr.runningTotal - pr.points;
+              return {
+                playerId: idx,
+                name: player?.name || `Jucător ${idx + 1}`,
+                avatar: player?.avatar || '👤',
+                isAi: !!player?.isAi,
+                bid: pr.bid ?? 0,
+                tricksWon: pr.tricksWon,
+                pointsGained: pr.points,
+                previousScore: prevScore,
+                newTotalScore: pr.runningTotal,
+              };
+            });
+            setRecapResults(mappedResults);
+          }
+        } else {
+          setRecapResults(null);
+        }
+
+        // Sync score sheet history
+        if (data.room.history && data.room.history.length > 0) {
+          const mappedHistory: RoundHistoryRecord[] = data.room.history.map((h) => ({
+            roundNumber: h.roundNumber,
+            cardCount: h.cardCount,
+            trumpSuit: h.trumpSuit,
+            playerResults: h.playerResults.map((pr) => ({
+              bid: pr.bid ?? 0,
+              tricksWon: pr.tricksWon,
+              points: pr.points,
+              runningTotal: pr.runningTotal,
+            })),
+          }));
+          setHistory(mappedHistory);
+        }
       } else if (data.room.status === 'game_over') {
         setGameState('gameover');
       }
