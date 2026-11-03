@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    overscroll-behavior: none;
+    background-color: #021a10;
+    color: #f1f5f9;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+.font-cinzel {
+  font-family: 'Cinzel', serif;
+}
+
+/* Custom card shadow and felt textures */
+.felt-table-emerald {
+  background: radial-gradient(ellipse at 50% 45%, #0f683e 0%, #084929 55%, #022013 100%);
+  box-shadow: inset 0 0 120px rgba(0, 0, 0, 0.8), inset 0 0 25px rgba(0, 0, 0, 0.95);
+}
+
+.felt-table-ruby {
+  background: radial-gradient(ellipse at 50% 45%, #7a1528 0%, #4a0715 55%, #1f0207 100%);
+  box-shadow: inset 0 0 120px rgba(0, 0, 0, 0.8), inset 0 0 25px rgba(0, 0, 0, 0.95);
+}
+
+.felt-table-noir {
+  background: radial-gradient(ellipse at 50% 45%, #1e293b 0%, #0f172a 55%, #020617 100%);
+  box-shadow: inset 0 0 120px rgba(0, 0, 0, 0.85), inset 0 0 25px rgba(0, 0, 0, 0.95);
+}
+
+.gold-table-rim {
+  border: 2px solid rgba(245, 158, 11, 0.55);
+  box-shadow: 0 0 20px rgba(245, 158, 11, 0.2), inset 0 0 15px rgba(0, 0, 0, 0.8);
+}
+
+.wood-trim {
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7), 0 0 0 4px #2b1406, 0 0 0 7px #160a03;
+}
+
+.card-shadow {
+  box-shadow: 0 4px 14px -2px rgba(0, 0, 0, 0.55), 0 2px 5px -1px rgba(0, 0, 0, 0.35);
+}
+
+.card-playable-glow {
+  box-shadow: 0 0 18px 4px rgba(250, 204, 21, 0.85), 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Whist Românesc",
+  "description": "Joc 2D complet de Whist Românesc împotriva AI-ului sau multiplayer în camere cu parolă, cu regulament oficial, licitație și tabel de scor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
