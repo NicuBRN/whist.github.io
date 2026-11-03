@@ -116,26 +116,16 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
         }
       );
 
-      if (payload?.room) {
+      if (payload && payload.room) {
         setCurrentRoom(payload.room);
         setMySeat(payload.mySeat);
         setActiveTab('in_room');
       } else {
-        // Fallback: check if room was created via WS
-        setTimeout(() => {
-          const cached = multiplayerService.getCachedRoomState();
-          if (cached) {
-            setCurrentRoom(cached.room);
-            setMySeat(cached.mySeat);
-            setActiveTab('in_room');
-          } else {
-            setErrorMessage('Camera se inițializează, vă rugăm așteptați...');
-            setActiveTab('in_room');
-          }
-        }, 600);
+        setErrorMessage('Nu s-a putut inițializa camera. Vă rugăm să reîncercați.');
       }
-    } catch {
-      setErrorMessage('Eroare la crearea camerei!');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Eroare la crearea camerei!';
+      setErrorMessage(msg);
     } finally {
       setIsSubmitting(false);
     }
@@ -538,22 +528,22 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
           {/* TAB 3: Inside Room Lobby */}
           {activeTab === 'in_room' && (
             !currentRoom ? (
-              /* Loading fallback so it NEVER freezes or goes blank */
               <div className="text-center py-10 space-y-4">
-                <div className="w-10 h-10 border-4 border-amber-400 border-t-transparent rounded-full animate-spin mx-auto" />
+                <AlertCircle className="w-10 h-10 text-amber-400 mx-auto" />
                 <div className="text-sm font-bold text-amber-300">
-                  Se conectează la masa de joc...
+                  Nu a fost găsită nicio cameră activă
                 </div>
                 <p className="text-xs text-slate-400 max-w-xs mx-auto">
-                  Stabilim conexiunea de date în timp real cu serverul.
+                  Vă rugăm să selectați o cameră din listă sau să creați o cameră nouă.
                 </p>
                 <button
                   type="button"
                   onClick={() => {
                     setActiveTab('browse');
                     setCurrentRoom(null);
+                    setErrorMessage('');
                   }}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-xl cursor-pointer"
+                  className="px-4 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 text-xs font-bold rounded-xl cursor-pointer shadow-md"
                 >
                   Înapoi la Lista de Camere
                 </button>
