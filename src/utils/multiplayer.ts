@@ -113,6 +113,7 @@ export interface RoomSyncState {
       runningTotal: number;
     }>;
   }>;
+  aiHands?: Record<string, Card[]>;
   updatedAt: number;
 }
 
@@ -162,7 +163,8 @@ class RealtimeMultiplayerService {
   private roomDocUnsub: Unsubscribe | null = null;
   private handDocUnsub: Unsubscribe | null = null;
   private roomsListUnsub: Unsubscribe | null = null;
-  private isProcessingAi: boolean = false;
+  private scheduledTurnKey: string | null = null;
+  private aiTurnTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     if (typeof window !== 'undefined') {
