@@ -102,11 +102,8 @@ const socketRooms = new Map<WebSocket, { roomId: string; playerId: string; seatI
 const DEFAULT_AI_NAMES = ['Radu (AI)', 'Elena (AI)', 'Mihai (AI)', 'Andrei (AI)', 'Ioana (AI)'];
 const DEFAULT_AI_AVATARS = ['🦊', '🦉', '🐻', '🦁', '🐺'];
 
-// Helper to broadcast room state to all players in that room
-function broadcastRoom(roomId: string) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-
+// Helper to build client-specific payload
+function buildClientRoomPayload(room: ServerRoomState, seatIndex: number) {
   const serializedRoom = {
     roomId: room.roomId,
     roomName: room.roomName,
@@ -130,44 +127,53 @@ function broadcastRoom(roomId: string) {
     updatedAt: room.updatedAt,
   };
 
+  const mySeat = Math.max(0, seatIndex);
+  const myHand = room.hands[mySeat] || [];
+  const legalCards =
+    room.phase === 'playing' && room.currentTurn === mySeat
+      ? getLegalCards(
+          myHand,
+          room.currentTrick.map((t) => ({ playerId: t.playerId, card: t.card })),
+          room.trumpSuit,
+          true
+        )
+      : [];
+
+  const currentRound = room.rounds[room.currentRoundIdx];
+  const isDealer = currentRound ? currentRound.dealerIndex === mySeat : false;
+  const forbiddenBid =
+    room.phase === 'bidding' && currentRound && isDealer
+      ? getForbiddenBid(
+          room.players.map((p) => p.bid),
+          currentRound.cardCount,
+          currentRound.dealerIndex,
+          mySeat
+        )
+      : -1;
+
+  return {
+    room: serializedRoom,
+    mySeat,
+    myHand,
+    legalCards,
+    forbiddenBid,
+  };
+}
+
+// Helper to broadcast room state to all players in that room
+function broadcastRoom(roomId: string) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       const meta = socketRooms.get(client);
       if (meta && meta.roomId === roomId) {
-        // Send player-specific state (including their private hand and legal cards)
-        const mySeat = meta.seatIndex;
-        const myHand = room.hands[mySeat] || [];
-        const legalCards =
-          room.phase === 'playing' && room.currentTurn === mySeat
-            ? getLegalCards(
-                myHand,
-                room.currentTrick.map((t) => ({ playerId: t.playerId, card: t.card })),
-                room.trumpSuit,
-                true
-              )
-            : [];
-
-        // Forbidden bid for human user if dealer and bidding
-        const currentRound = room.rounds[room.currentRoundIdx];
-        const isDealer = currentRound ? currentRound.dealerIndex === mySeat : false;
-        const forbiddenBid =
-          room.phase === 'bidding' && currentRound && isDealer
-            ? getForbiddenBid(
-                room.players.map((p) => p.bid),
-                currentRound.cardCount,
-                currentRound.dealerIndex,
-                mySeat
-              )
-            : -1;
-
+        const payload = buildClientRoomPayload(room, meta.seatIndex);
         client.send(
           JSON.stringify({
             type: 'ROOM_STATE',
-            room: serializedRoom,
-            mySeat,
-            myHand,
-            legalCards,
-            forbiddenBid,
+            ...payload,
           })
         );
       }
@@ -453,10 +459,219 @@ function serverPlayCard(room: ServerRoomState, seatIndex: number, card: Card) {
 }
 
 // ==========================================
+// SHARED ROOM LOGIC (USED BY BOTH WS & REST)
+// ==========================================
+
+function createRoomLogic(
+  roomName: string,
+  password: string | undefined,
+  maxPlayers: number,
+  hostPlayer: { id: string; name: string; avatar?: string }
+) {
+  const roomId = `WHIST-${Math.floor(1000 + Math.random() * 9000)}`;
+  const newRoom: ServerRoomState = {
+    roomId,
+    roomName: roomName?.trim() || 'Masa de Whist Românesc',
+    hasPassword: !!password && password.trim().length > 0,
+    password: password ? password.trim() : undefined,
+    hostId: hostPlayer.id,
+    maxPlayers: Math.min(6, Math.max(3, maxPlayers || 4)),
+    status: 'lobby',
+    players: [
+      {
+        id: hostPlayer.id,
+        name: hostPlayer.name || 'Gazdă',
+        avatar: hostPlayer.avatar || '👑',
+        isAi: false,
+        seatIndex: 0,
+        isReady: true,
+        score: 0,
+        bid: null,
+        tricksWon: 0,
+      },
+    ],
+    rounds: [],
+    currentRoundIdx: 0,
+    phase: 'dealing',
+    currentTurn: 0,
+    trumpCard: null,
+    trumpSuit: null,
+    hands: {},
+    currentTrick: [],
+    winningCardId: null,
+    trickWinnerBanner: null,
+    statusMessage: 'Sală creată. Așteptare jucători...',
+    history: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+
+  rooms.set(roomId, newRoom);
+  broadcastRoomsList();
+  const payload = buildClientRoomPayload(newRoom, 0);
+  return { roomId, ...payload };
+}
+
+function joinRoomLogic(
+  roomId: string,
+  player: { id: string; name: string; avatar?: string },
+  password?: string
+): { success: true; payload: ReturnType<typeof buildClientRoomPayload> } | { success: false; error: string } {
+  const room = rooms.get(roomId);
+  if (!room) {
+    return { success: false, error: 'Camera nu există!' };
+  }
+  if (room.hasPassword && room.password !== password) {
+    return { success: false, error: 'Parolă incorectă!' };
+  }
+  const existingIndex = room.players.findIndex((p) => p.id === player.id);
+  if (existingIndex >= 0) {
+    const payload = buildClientRoomPayload(room, existingIndex);
+    return { success: true, payload };
+  }
+  if (room.players.length >= room.maxPlayers) {
+    return { success: false, error: 'Camera este plină!' };
+  }
+  if (room.status !== 'lobby') {
+    return { success: false, error: 'Partida a început deja!' };
+  }
+
+  const seatIndex = room.players.length;
+  const newPlayer: ServerRoomPlayer = {
+    id: player.id,
+    name: player.name,
+    avatar: player.avatar || '😎',
+    isAi: false,
+    seatIndex,
+    isReady: false,
+    score: 0,
+    bid: null,
+    tricksWon: 0,
+  };
+
+  room.players.push(newPlayer);
+  room.updatedAt = Date.now();
+  broadcastRoom(roomId);
+  broadcastRoomsList();
+
+  const payload = buildClientRoomPayload(room, seatIndex);
+  return { success: true, payload };
+}
+
+function handleRoomActionLogic(roomId: string, data: any): { success: boolean; error?: string } {
+  const room = rooms.get(roomId);
+  if (!room) return { success: false, error: 'Camera nu există!' };
+
+  const { type, playerId, seatIndex, bid, card } = data;
+
+  if (type === 'ADD_AI') {
+    if (room.status !== 'lobby' || room.players.length >= room.maxPlayers) {
+      return { success: false, error: 'Camera este plină' };
+    }
+    const idx = room.players.length;
+    const aiName = DEFAULT_AI_NAMES[idx - 1] || `AI ${idx}`;
+    const aiAvatar = DEFAULT_AI_AVATARS[idx - 1] || '🤖';
+    room.players.push({
+      id: `ai-${idx}-${Date.now()}`,
+      name: aiName,
+      avatar: aiAvatar,
+      isAi: true,
+      seatIndex: idx,
+      isReady: true,
+      score: 0,
+      bid: null,
+      tricksWon: 0,
+    });
+    room.updatedAt = Date.now();
+    broadcastRoom(roomId);
+    return { success: true };
+  }
+
+  if (type === 'TOGGLE_READY') {
+    const player = room.players.find((p) => p.id === playerId);
+    if (player) {
+      player.isReady = !player.isReady;
+      room.updatedAt = Date.now();
+      broadcastRoom(roomId);
+      return { success: true };
+    }
+    return { success: false, error: 'Jucătorul nu a fost găsit' };
+  }
+
+  if (type === 'START_ROOM_GAME') {
+    if (room.status !== 'lobby') return { success: false, error: 'Partida a început deja' };
+    while (room.players.length < Math.max(3, room.maxPlayers)) {
+      const idx = room.players.length;
+      const aiName = DEFAULT_AI_NAMES[idx - 1] || `AI ${idx}`;
+      const aiAvatar = DEFAULT_AI_AVATARS[idx - 1] || '🤖';
+      room.players.push({
+        id: `ai-${idx}-${Date.now()}`,
+        name: aiName,
+        avatar: aiAvatar,
+        isAi: true,
+        seatIndex: idx,
+        isReady: true,
+        score: 0,
+        bid: null,
+        tricksWon: 0,
+      });
+    }
+    const count = room.players.length;
+    room.rounds = generateRounds(count);
+    room.status = 'playing';
+    serverStartRound(room, 0);
+    return { success: true };
+  }
+
+  if (type === 'START_BIDDING') {
+    if (room.phase === 'inspecting') {
+      serverStartBidding(room);
+    }
+    return { success: true };
+  }
+
+  if (type === 'PLACE_BID') {
+    serverPlaceBid(room, seatIndex, bid);
+    return { success: true };
+  }
+
+  if (type === 'PLAY_CARD') {
+    serverPlayCard(room, seatIndex, card);
+    return { success: true };
+  }
+
+  if (type === 'NEXT_ROUND') {
+    if (room.phase === 'round_recap') {
+      serverStartRound(room, room.currentRoundIdx + 1);
+    }
+    return { success: true };
+  }
+
+  if (type === 'LEAVE_ROOM') {
+    room.players = room.players.filter((p) => p.id !== playerId);
+    const hasHuman = room.players.some((p) => !p.isAi);
+    if (room.players.length === 0 || !hasHuman) {
+      rooms.delete(roomId);
+    } else {
+      room.players.forEach((p, idx) => {
+        p.seatIndex = idx;
+      });
+      if (room.hostId === playerId && room.players[0]) {
+        room.hostId = room.players[0].id;
+      }
+      broadcastRoom(roomId);
+    }
+    broadcastRoomsList();
+    return { success: true };
+  }
+
+  return { success: false, error: 'Acțiune necunoscută' };
+}
+
+// ==========================================
 // WEBSOCKET CONNECTION HANDLER
 // ==========================================
 wss.on('connection', (ws: WebSocket) => {
-  // Send current rooms list immediately on connect
   broadcastRoomsList();
 
   ws.on('message', (message: string) => {
@@ -468,193 +683,21 @@ wss.on('connection', (ws: WebSocket) => {
         broadcastRoomsList();
       } else if (type === 'CREATE_ROOM') {
         const { roomName, password, maxPlayers = 4, hostPlayer } = data;
-        const roomId = `WHIST-${Math.floor(1000 + Math.random() * 9000)}`;
-
-        const newRoom: ServerRoomState = {
-          roomId,
-          roomName: roomName?.trim() || 'Masa de Whist',
-          hasPassword: !!password && password.trim().length > 0,
-          password: password ? password.trim() : undefined,
-          hostId: hostPlayer.id,
-          maxPlayers: Math.min(6, Math.max(3, maxPlayers)),
-          status: 'lobby',
-          players: [
-            {
-              id: hostPlayer.id,
-              name: hostPlayer.name || 'Gazdă',
-              avatar: hostPlayer.avatar || '👑',
-              isAi: false,
-              seatIndex: 0,
-              isReady: true,
-              score: 0,
-              bid: null,
-              tricksWon: 0,
-            },
-          ],
-          rounds: [],
-          currentRoundIdx: 0,
-          phase: 'dealing',
-          currentTurn: 0,
-          trumpCard: null,
-          trumpSuit: null,
-          hands: {},
-          currentTrick: [],
-          winningCardId: null,
-          trickWinnerBanner: null,
-          statusMessage: 'Sală creată. Așteptare jucători...',
-          history: [],
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        };
-
-        rooms.set(roomId, newRoom);
-        socketRooms.set(ws, { roomId, playerId: hostPlayer.id, seatIndex: 0 });
-        broadcastRoom(roomId);
+        const result = createRoomLogic(roomName, password, maxPlayers, hostPlayer);
+        socketRooms.set(ws, { roomId: result.roomId, playerId: hostPlayer.id, seatIndex: 0 });
+        ws.send(JSON.stringify({ type: 'ROOM_STATE', ...result }));
       } else if (type === 'JOIN_ROOM') {
         const { roomId, player, password } = data;
-        const room = rooms.get(roomId);
-
-        if (!room) {
-          ws.send(JSON.stringify({ type: 'ERROR', message: 'Camera nu există!' }));
+        const result = joinRoomLogic(roomId, player, password);
+        if (!result.success) {
+          ws.send(JSON.stringify({ type: 'ERROR', message: result.error }));
           return;
         }
-
-        if (room.hasPassword && room.password !== password) {
-          ws.send(JSON.stringify({ type: 'ERROR', message: 'Parolă incorectă!' }));
-          return;
-        }
-
-        if (room.players.length >= room.maxPlayers) {
-          ws.send(JSON.stringify({ type: 'ERROR', message: 'Camera este plină!' }));
-          return;
-        }
-
-        if (room.status !== 'lobby') {
-          ws.send(JSON.stringify({ type: 'ERROR', message: 'Partida a început deja!' }));
-          return;
-        }
-
-        // Add player to room
-        const seatIndex = room.players.length;
-        const newPlayer: ServerRoomPlayer = {
-          id: player.id,
-          name: player.name,
-          avatar: player.avatar || '😎',
-          isAi: false,
-          seatIndex,
-          isReady: false,
-          score: 0,
-          bid: null,
-          tricksWon: 0,
-        };
-
-        room.players.push(newPlayer);
-        room.updatedAt = Date.now();
-        socketRooms.set(ws, { roomId, playerId: player.id, seatIndex });
-        broadcastRoom(roomId);
-      } else if (type === 'ADD_AI') {
+        socketRooms.set(ws, { roomId, playerId: player.id, seatIndex: result.payload.mySeat });
+        ws.send(JSON.stringify({ type: 'ROOM_STATE', ...result.payload }));
+      } else {
         const { roomId } = data;
-        const room = rooms.get(roomId);
-        if (!room || room.status !== 'lobby' || room.players.length >= room.maxPlayers) return;
-
-        const seatIndex = room.players.length;
-        const aiName = DEFAULT_AI_NAMES[seatIndex - 1] || `AI ${seatIndex}`;
-        const aiAvatar = DEFAULT_AI_AVATARS[seatIndex - 1] || '🤖';
-
-        room.players.push({
-          id: `ai-${seatIndex}-${Date.now()}`,
-          name: aiName,
-          avatar: aiAvatar,
-          isAi: true,
-          seatIndex,
-          isReady: true,
-          score: 0,
-          bid: null,
-          tricksWon: 0,
-        });
-
-        room.updatedAt = Date.now();
-        broadcastRoom(roomId);
-      } else if (type === 'TOGGLE_READY') {
-        const { roomId, playerId } = data;
-        const room = rooms.get(roomId);
-        if (!room) return;
-
-        const player = room.players.find((p) => p.id === playerId);
-        if (player) {
-          player.isReady = !player.isReady;
-          room.updatedAt = Date.now();
-          broadcastRoom(roomId);
-        }
-      } else if (type === 'START_ROOM_GAME') {
-        const { roomId } = data;
-        const room = rooms.get(roomId);
-        if (!room || room.status !== 'lobby') return;
-
-        // Fill remaining empty seats with AI if less than maxPlayers (minimum 3)
-        while (room.players.length < Math.max(3, room.maxPlayers)) {
-          const seatIndex = room.players.length;
-          const aiName = DEFAULT_AI_NAMES[seatIndex - 1] || `AI ${seatIndex}`;
-          const aiAvatar = DEFAULT_AI_AVATARS[seatIndex - 1] || '🤖';
-          room.players.push({
-            id: `ai-${seatIndex}-${Date.now()}`,
-            name: aiName,
-            avatar: aiAvatar,
-            isAi: true,
-            seatIndex,
-            isReady: true,
-            score: 0,
-            bid: null,
-            tricksWon: 0,
-          });
-        }
-
-        const count = room.players.length;
-        room.rounds = generateRounds(count);
-        room.status = 'playing';
-        serverStartRound(room, 0);
-      } else if (type === 'START_BIDDING') {
-        const { roomId } = data;
-        const room = rooms.get(roomId);
-        if (!room || room.phase !== 'inspecting') return;
-        serverStartBidding(room);
-      } else if (type === 'PLACE_BID') {
-        const { roomId, seatIndex, bid } = data;
-        const room = rooms.get(roomId);
-        if (!room) return;
-        serverPlaceBid(room, seatIndex, bid);
-      } else if (type === 'PLAY_CARD') {
-        const { roomId, seatIndex, card } = data;
-        const room = rooms.get(roomId);
-        if (!room) return;
-        serverPlayCard(room, seatIndex, card);
-      } else if (type === 'NEXT_ROUND') {
-        const { roomId } = data;
-        const room = rooms.get(roomId);
-        if (!room || room.phase !== 'round_recap') return;
-        serverStartRound(room, room.currentRoundIdx + 1);
-      } else if (type === 'LEAVE_ROOM') {
-        const meta = socketRooms.get(ws);
-        if (meta) {
-          const room = rooms.get(meta.roomId);
-          if (room) {
-            room.players = room.players.filter((p) => p.id !== meta.playerId);
-            if (room.players.length === 0) {
-              rooms.delete(meta.roomId);
-            } else {
-              // Reindex seats
-              room.players.forEach((p, idx) => {
-                p.seatIndex = idx;
-              });
-              if (room.hostId === meta.playerId && room.players[0]) {
-                room.hostId = room.players[0].id;
-              }
-              broadcastRoom(meta.roomId);
-            }
-            broadcastRoomsList();
-          }
-          socketRooms.delete(ws);
-        }
+        handleRoomActionLogic(roomId, data);
       }
     } catch (err) {
       console.error('Error parsing WebSocket message:', err);
@@ -665,11 +708,9 @@ wss.on('connection', (ws: WebSocket) => {
     const meta = socketRooms.get(ws);
     if (meta) {
       socketRooms.delete(ws);
-      // Wait a moment for reconnection, otherwise leave room if in lobby
       setTimeout(() => {
         const room = rooms.get(meta.roomId);
         if (room && room.status === 'lobby') {
-          // Check if any client still connected with this playerId
           let isStillConnected = false;
           socketRooms.forEach((v) => {
             if (v.roomId === meta.roomId && v.playerId === meta.playerId) {
@@ -713,6 +754,59 @@ app.get('/api/rooms', (_req: Request, res: Response) => {
     updatedAt: r.updatedAt,
   }));
   res.json({ rooms: list });
+});
+
+app.post('/api/rooms/create', (req: Request, res: Response) => {
+  const { roomName, password, maxPlayers = 4, hostPlayer } = req.body;
+  if (!hostPlayer?.id) {
+    res.status(400).json({ error: 'Jucător invalid' });
+    return;
+  }
+  const result = createRoomLogic(roomName, password, maxPlayers, hostPlayer);
+  res.json({ success: true, ...result });
+});
+
+app.post('/api/rooms/:id/join', (req: Request, res: Response) => {
+  const { player, password } = req.body;
+  if (!player?.id) {
+    res.status(400).json({ error: 'Jucător invalid' });
+    return;
+  }
+  const result = joinRoomLogic(req.params.id, player, password);
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json({ success: true, ...result.payload });
+});
+
+app.get('/api/rooms/:id/state', (req: Request, res: Response) => {
+  const room = rooms.get(req.params.id);
+  if (!room) {
+    res.status(404).json({ error: 'Camera nu a fost găsită' });
+    return;
+  }
+  const playerId = (req.query.playerId as string) || '';
+  const seatIndex = room.players.findIndex((p) => p.id === playerId);
+  const payload = buildClientRoomPayload(room, seatIndex >= 0 ? seatIndex : 0);
+  res.json({ success: true, ...payload });
+});
+
+app.post('/api/rooms/:id/action', (req: Request, res: Response) => {
+  const result = handleRoomActionLogic(req.params.id, req.body);
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  const playerId = req.body.playerId || '';
+  const room = rooms.get(req.params.id);
+  if (room) {
+    const seatIndex = room.players.findIndex((p) => p.id === playerId);
+    const payload = buildClientRoomPayload(room, seatIndex >= 0 ? seatIndex : 0);
+    res.json({ success: true, ...payload });
+  } else {
+    res.json({ success: true });
+  }
 });
 
 app.get('/api/rooms/:id', (req: Request, res: Response) => {

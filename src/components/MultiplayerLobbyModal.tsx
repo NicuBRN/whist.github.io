@@ -23,6 +23,7 @@ import {
   Globe,
   RefreshCw,
   AlertCircle,
+  Loader2,
 } from 'lucide-react';
 
 interface MultiplayerLobbyModalProps {
@@ -54,6 +55,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
   const [errorMessage, setErrorMessage] = useState('');
   const [copiedCode, setCopiedCode] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Setup WebSocket room listings and active room sync
   useEffect(() => {
@@ -71,9 +73,17 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
 
     const unsubErrors = multiplayerService.subscribeErrors((msg) => {
       setErrorMessage(msg);
+      setIsSubmitting(false);
     });
 
     multiplayerService.fetchInitialRooms();
+
+    // Check if there is an existing cached room
+    const cached = multiplayerService.getCachedRoomState();
+    if (cached) {
+      setCurrentRoom(cached.room);
+      setMySeat(cached.mySeat);
+    }
 
     return () => {
       unsubRooms();
@@ -89,20 +99,46 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
   };
 
   // Create room handler
-  const handleCreateRoom = (e: React.FormEvent) => {
+  const handleCreateRoom = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
-    multiplayerService.createRoom(
-      createName.trim() || 'Masa de Whist Românesc',
-      createPassword.trim() || undefined,
-      createMaxPlayers,
-      {
-        id: currentUserId,
-        name: currentUserName.trim() || 'Tu',
-        avatar: '👑',
+    setIsSubmitting(true);
+
+    try {
+      const payload = await multiplayerService.createRoom(
+        createName.trim() || 'Masa de Whist Românesc',
+        createPassword.trim() || undefined,
+        createMaxPlayers,
+        {
+          id: currentUserId,
+          name: currentUserName.trim() || 'Tu',
+          avatar: '👑',
+        }
+      );
+
+      if (payload?.room) {
+        setCurrentRoom(payload.room);
+        setMySeat(payload.mySeat);
+        setActiveTab('in_room');
+      } else {
+        // Fallback: check if room was created via WS
+        setTimeout(() => {
+          const cached = multiplayerService.getCachedRoomState();
+          if (cached) {
+            setCurrentRoom(cached.room);
+            setMySeat(cached.mySeat);
+            setActiveTab('in_room');
+          } else {
+            setErrorMessage('Camera se inițializează, vă rugăm așteptați...');
+            setActiveTab('in_room');
+          }
+        }, 600);
       }
-    );
-    setActiveTab('in_room');
+    } catch {
+      setErrorMessage('Eroare la crearea camerei!');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   // Join room initiation
@@ -121,18 +157,34 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
     executeJoin(joinRoomId, joinPassword);
   };
 
-  const executeJoin = (roomId: string, pass: string) => {
+  const executeJoin = async (roomId: string, pass: string) => {
     setErrorMessage('');
-    multiplayerService.joinRoom(
-      roomId,
-      {
-        id: currentUserId,
-        name: currentUserName.trim() || 'Jucător',
-        avatar: '😎',
-      },
-      pass
-    );
-    setActiveTab('in_room');
+    setIsSubmitting(true);
+    try {
+      const result = await multiplayerService.joinRoom(
+        roomId,
+        {
+          id: currentUserId,
+          name: currentUserName.trim() || 'Jucător',
+          avatar: '😎',
+        },
+        pass
+      );
+
+      if (result.success && result.payload?.room) {
+        setCurrentRoom(result.payload.room);
+        setMySeat(result.payload.mySeat);
+        setActiveTab('in_room');
+        setJoinRoomId('');
+        setJoinPassword('');
+      } else {
+        setErrorMessage(result.error || 'Parolă incorectă sau camera este indisponibilă!');
+      }
+    } catch {
+      setErrorMessage('Nu s-a putut conecta la cameră!');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   // Add AI bot to room
@@ -206,7 +258,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
           </div>
         )}
 
-        {/* Tabs if not in room */}
+        {/* Navigation Tabs (Always accessible unless inside an active room with confirmed room) */}
         {activeTab !== 'in_room' && (
           <div className="flex border-b border-emerald-900/60 bg-slate-950/60">
             <button
@@ -222,7 +274,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                   : 'border-transparent text-slate-400 hover:text-slate-200'
               }`}
             >
-              Camere Publice & Private ({roomsList.length})
+              Camere Active ({roomsList.length})
             </button>
             <button
               type="button"
@@ -287,9 +339,17 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                     </button>
                     <button
                       type="submit"
-                      className="flex-1 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs cursor-pointer shadow-md"
+                      disabled={isSubmitting}
+                      className="flex-1 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs cursor-pointer shadow-md flex items-center justify-center gap-1.5"
                     >
-                      Intră în Cameră
+                      {isSubmitting ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Se verifică...</span>
+                        </>
+                      ) : (
+                        <span>Intră în Cameră</span>
+                      )}
                     </button>
                   </div>
                 </form>
@@ -371,7 +431,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                             <button
                               type="button"
                               onClick={() => handleJoinRoomClick(r)}
-                              disabled={r.playerCount >= (r.maxPlayers || 4) || r.status === 'playing'}
+                              disabled={r.playerCount >= (r.maxPlayers || 4) || r.status === 'playing' || isSubmitting}
                               className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-colors ${
                                 r.playerCount >= (r.maxPlayers || 4) || r.status === 'playing'
                                   ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
@@ -459,157 +519,188 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold rounded-xl text-xs cursor-pointer shadow-lg shadow-amber-950/50"
+                  disabled={isSubmitting}
+                  className="px-5 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold rounded-xl text-xs cursor-pointer shadow-lg shadow-amber-950/50 flex items-center gap-1.5"
                 >
-                  Deschide Camera Online
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Se creează camera...</span>
+                    </>
+                  ) : (
+                    <span>Deschide Camera Online</span>
+                  )}
                 </button>
               </div>
             </form>
           )}
 
           {/* TAB 3: Inside Room Lobby */}
-          {activeTab === 'in_room' && currentRoom && (
-            <div className="space-y-4">
-              {/* Room details banner */}
-              <div className="bg-slate-950/70 border border-amber-500/30 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h3 className="font-bold text-base text-amber-300">{currentRoom.roomName}</h3>
-                  <div className="flex items-center gap-2 text-xs text-slate-400 font-mono mt-0.5">
-                    <span>
-                      Cod Cameră: <strong className="text-white">{currentRoom.roomId}</strong>
-                    </span>
-                    {currentRoom.hasPassword && (
-                      <span className="text-amber-400 flex items-center gap-1">
-                        <Lock className="w-3 h-3" /> Protejată cu parolă
+          {activeTab === 'in_room' && (
+            !currentRoom ? (
+              /* Loading fallback so it NEVER freezes or goes blank */
+              <div className="text-center py-10 space-y-4">
+                <div className="w-10 h-10 border-4 border-amber-400 border-t-transparent rounded-full animate-spin mx-auto" />
+                <div className="text-sm font-bold text-amber-300">
+                  Se conectează la masa de joc...
+                </div>
+                <p className="text-xs text-slate-400 max-w-xs mx-auto">
+                  Stabilim conexiunea de date în timp real cu serverul.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('browse');
+                    setCurrentRoom(null);
+                  }}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-xl cursor-pointer"
+                >
+                  Înapoi la Lista de Camere
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {/* Room details banner */}
+                <div className="bg-slate-950/70 border border-amber-500/30 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="font-bold text-base text-amber-300">{currentRoom.roomName}</h3>
+                    <div className="flex items-center gap-2 text-xs text-slate-400 font-mono mt-0.5">
+                      <span>
+                        Cod Cameră: <strong className="text-white">{currentRoom.roomId}</strong>
                       </span>
+                      {currentRoom.hasPassword && (
+                        <span className="text-amber-400 flex items-center gap-1">
+                          <Lock className="w-3 h-3" /> Protejată cu parolă
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleCopyCode}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded-lg flex items-center gap-1.5 cursor-pointer"
+                  >
+                    {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedCode ? 'Cod Copiat!' : 'Copiază Cod'}</span>
+                  </button>
+                </div>
+
+                {/* Player Slots */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {Array.from({ length: maxSlots }).map((_, slotIdx) => {
+                    const player = currentRoom.players[slotIdx];
+                    const isMe = slotIdx === mySeat;
+
+                    return (
+                      <div
+                        key={slotIdx}
+                        className={`p-3 rounded-xl border flex items-center justify-between ${
+                          player
+                            ? isMe
+                              ? 'bg-amber-950/40 border-amber-500/60 ring-1 ring-amber-400/40'
+                              : 'bg-slate-900/80 border-emerald-800/80'
+                            : 'bg-slate-950/40 border-dashed border-slate-800'
+                        }`}
+                      >
+                        {player ? (
+                          <div className="flex items-center gap-2.5">
+                            <span className="text-2xl">{player.avatar}</span>
+                            <div>
+                              <div className="font-bold text-xs sm:text-sm text-slate-100 flex items-center gap-1.5">
+                                <span>{player.name}</span>
+                                {isMe && (
+                                  <span className="text-[10px] bg-amber-400 text-slate-950 font-black px-1.5 py-0.2 rounded">
+                                    Tu
+                                  </span>
+                                )}
+                                {player.id === currentRoom.hostId && (
+                                  <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 px-1.5 py-0.2 rounded font-sans">
+                                    Gazdă
+                                  </span>
+                                )}
+                                {player.isAi && (
+                                  <span className="text-[10px] bg-sky-500/20 text-sky-300 border border-sky-500/40 px-1.5 py-0.2 rounded font-sans">
+                                    AI
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-slate-400">
+                                Locul {slotIdx + 1}
+                              </div>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="text-slate-500 text-xs flex items-center gap-2">
+                            <Users className="w-4 h-4" />
+                            <span>Locul {slotIdx + 1} liber</span>
+                          </div>
+                        )}
+
+                        <div>
+                          {player ? (
+                            <span
+                              className={`px-2 py-0.5 rounded text-[11px] font-bold ${
+                                player.isReady
+                                  ? 'bg-emerald-950/60 text-emerald-400 border border-emerald-500/40'
+                                  : 'bg-slate-800 text-slate-400'
+                              }`}
+                            >
+                              {player.isReady ? 'Gata' : 'În pregătire'}
+                            </span>
+                          ) : currentRoom.hostId === currentUserId ? (
+                            <button
+                              type="button"
+                              onClick={handleAddAi}
+                              className="px-2.5 py-1 bg-emerald-900/60 hover:bg-emerald-800 text-emerald-200 border border-emerald-500/40 rounded text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                            >
+                              <Bot className="w-3 h-3" /> + Robot AI
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Lobby Action Controls */}
+                <div className="pt-2 flex flex-wrap items-center justify-between gap-2 border-t border-emerald-900/60">
+                  <button
+                    type="button"
+                    onClick={handleLeaveRoom}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-xl cursor-pointer"
+                  >
+                    Părăsește Camera
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleToggleReady}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 text-xs font-bold rounded-xl cursor-pointer flex items-center gap-1.5"
+                    >
+                      <UserCheck className="w-4 h-4" />
+                      <span>Sunt Gata</span>
+                    </button>
+
+                    {currentRoom.hostId === currentUserId && (
+                      <button
+                        type="button"
+                        onClick={handleLaunchGame}
+                        className="px-5 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer shadow-lg shadow-amber-950/50"
+                      >
+                        <Play className="w-4 h-4" />
+                        <span>
+                          {currentRoom.players.length < 3
+                            ? `Pornește cu AI (${currentRoom.players.length}/${maxSlots})`
+                            : 'Pornește Partida!'}
+                        </span>
+                      </button>
                     )}
                   </div>
                 </div>
-
-                <button
-                  type="button"
-                  onClick={handleCopyCode}
-                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded-lg flex items-center gap-1.5 cursor-pointer"
-                >
-                  {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedCode ? 'Cod Copiat!' : 'Copiază Cod'}</span>
-                </button>
               </div>
-
-              {/* Player Slots */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                {Array.from({ length: maxSlots }).map((_, slotIdx) => {
-                  const player = currentRoom.players[slotIdx];
-                  const isMe = slotIdx === mySeat;
-
-                  return (
-                    <div
-                      key={slotIdx}
-                      className={`p-3 rounded-xl border flex items-center justify-between ${
-                        player
-                          ? isMe
-                            ? 'bg-amber-950/40 border-amber-500/60 ring-1 ring-amber-400/40'
-                            : 'bg-slate-900/80 border-emerald-800/80'
-                          : 'bg-slate-950/40 border-dashed border-slate-800'
-                      }`}
-                    >
-                      {player ? (
-                        <div className="flex items-center gap-2.5">
-                          <span className="text-2xl">{player.avatar}</span>
-                          <div>
-                            <div className="font-bold text-xs sm:text-sm text-slate-100 flex items-center gap-1.5">
-                              <span>{player.name}</span>
-                              {isMe && (
-                                <span className="text-[10px] bg-amber-400 text-slate-950 font-black px-1.5 py-0.2 rounded">
-                                  Tu
-                                </span>
-                              )}
-                              {player.id === currentRoom.hostId && (
-                                <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 px-1.5 py-0.2 rounded font-sans">
-                                  Gazdă
-                                </span>
-                              )}
-                              {player.isAi && (
-                                <span className="text-[10px] bg-sky-500/20 text-sky-300 border border-sky-500/40 px-1.5 py-0.2 rounded font-sans">
-                                  AI
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-[11px] text-slate-400">
-                              Locul {slotIdx + 1}
-                            </div>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="text-slate-500 text-xs flex items-center gap-2">
-                          <Users className="w-4 h-4" />
-                          <span>Locul {slotIdx + 1} liber</span>
-                        </div>
-                      )}
-
-                      <div>
-                        {player ? (
-                          <span
-                            className={`px-2 py-0.5 rounded text-[11px] font-bold ${
-                              player.isReady
-                                ? 'bg-emerald-950/60 text-emerald-400 border border-emerald-500/40'
-                                : 'bg-slate-800 text-slate-400'
-                            }`}
-                          >
-                            {player.isReady ? 'Gata' : 'În pregătire'}
-                          </span>
-                        ) : currentRoom.hostId === currentUserId ? (
-                          <button
-                            type="button"
-                            onClick={handleAddAi}
-                            className="px-2.5 py-1 bg-emerald-900/60 hover:bg-emerald-800 text-emerald-200 border border-emerald-500/40 rounded text-xs font-semibold flex items-center gap-1 cursor-pointer"
-                          >
-                            <Bot className="w-3 h-3" /> + Robot AI
-                          </button>
-                        ) : null}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* Lobby Action Controls */}
-              <div className="pt-2 flex flex-wrap items-center justify-between gap-2 border-t border-emerald-900/60">
-                <button
-                  type="button"
-                  onClick={handleLeaveRoom}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-xl cursor-pointer"
-                >
-                  Părăsește Camera
-                </button>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleToggleReady}
-                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 text-xs font-bold rounded-xl cursor-pointer flex items-center gap-1.5"
-                  >
-                    <UserCheck className="w-4 h-4" />
-                    <span>Sunt Gata</span>
-                  </button>
-
-                  {currentRoom.hostId === currentUserId && (
-                    <button
-                      type="button"
-                      onClick={handleLaunchGame}
-                      className="px-5 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer shadow-lg shadow-amber-950/50"
-                    >
-                      <Play className="w-4 h-4" />
-                      <span>
-                        {currentRoom.players.length < 3
-                          ? `Pornește cu AI (${currentRoom.players.length}/${maxSlots})`
-                          : 'Pornește Partida!'}
-                      </span>
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
+            )
           )}
         </div>
       </div>

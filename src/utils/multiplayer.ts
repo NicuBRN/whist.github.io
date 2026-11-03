@@ -78,26 +78,21 @@ export interface RoomListing {
   updatedAt: number;
 }
 
-type ServerMessage =
-  | { type: 'ROOMS_LIST'; rooms: RoomListing[] }
-  | {
-      type: 'ROOM_STATE';
-      room: RoomSyncState;
-      mySeat: number;
-      myHand: Card[];
-      legalCards: Card[];
-      forbiddenBid: number;
-    }
-  | { type: 'ERROR'; message: string };
-
-type RoomsListListener = (rooms: RoomListing[]) => void;
-type RoomStateListener = (data: {
+export interface RoomStatePayload {
   room: RoomSyncState;
   mySeat: number;
   myHand: Card[];
   legalCards: Card[];
   forbiddenBid: number;
-}) => void;
+}
+
+type ServerMessage =
+  | { type: 'ROOMS_LIST'; rooms: RoomListing[] }
+  | ({ type: 'ROOM_STATE' } & RoomStatePayload)
+  | { type: 'ERROR'; message: string };
+
+type RoomsListListener = (rooms: RoomListing[]) => void;
+type RoomStateListener = (data: RoomStatePayload) => void;
 type ErrorListener = (errorMsg: string) => void;
 
 class RealtimeMultiplayerService {
@@ -106,17 +101,21 @@ class RealtimeMultiplayerService {
   private roomStateListeners: RoomStateListener[] = [];
   private errorListeners: ErrorListener[] = [];
   private cachedRooms: RoomListing[] = [];
-  private isConnected = false;
-  private reconnectTimer: number | null = null;
+  private cachedRoomState: RoomStatePayload | null = null;
+  private activeRoomId: string | null = null;
+  private activePlayerId: string = 'user-1';
+  private pollingTimer: number | null = null;
+  private lobbyPollingTimer: number | null = null;
 
   constructor() {
     if (typeof window !== 'undefined') {
-      this.connect();
+      this.initWebSocket();
       this.fetchInitialRooms();
+      this.startLobbyPolling();
     }
   }
 
-  private connect() {
+  private initWebSocket() {
     if (typeof window === 'undefined') return;
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -124,8 +123,7 @@ class RealtimeMultiplayerService {
       this.ws = new WebSocket(wsUrl);
 
       this.ws.onopen = () => {
-        this.isConnected = true;
-        this.send({ type: 'GET_ROOMS' });
+        this.sendWs({ type: 'GET_ROOMS' });
       };
 
       this.ws.onmessage = (event) => {
@@ -135,7 +133,15 @@ class RealtimeMultiplayerService {
             this.cachedRooms = data.rooms;
             this.roomsListListeners.forEach((l) => l(data.rooms));
           } else if (data.type === 'ROOM_STATE') {
-            this.roomStateListeners.forEach((l) => l(data));
+            this.activeRoomId = data.room.roomId;
+            this.cachedRoomState = {
+              room: data.room,
+              mySeat: data.mySeat,
+              myHand: data.myHand || [],
+              legalCards: data.legalCards || [],
+              forbiddenBid: data.forbiddenBid ?? -1,
+            };
+            this.roomStateListeners.forEach((l) => l(this.cachedRoomState!));
           } else if (data.type === 'ERROR') {
             this.errorListeners.forEach((l) => l(data.message));
           }
@@ -145,38 +151,64 @@ class RealtimeMultiplayerService {
       };
 
       this.ws.onclose = () => {
-        this.isConnected = false;
-        this.scheduleReconnect();
+        setTimeout(() => this.initWebSocket(), 4000);
       };
 
       this.ws.onerror = () => {
-        this.isConnected = false;
+        // Will rely on HTTP REST polling
       };
     } catch {
-      this.scheduleReconnect();
+      // Ignore, HTTP fallback is active
     }
   }
 
-  private scheduleReconnect() {
-    if (this.reconnectTimer) return;
-    this.reconnectTimer = window.setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
+  private sendWs(data: unknown) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(JSON.stringify(data));
+      } catch {
+        // Fall back to REST
+      }
+    }
+  }
+
+  private startLobbyPolling() {
+    if (typeof window === 'undefined') return;
+    if (this.lobbyPollingTimer) clearInterval(this.lobbyPollingTimer);
+    this.lobbyPollingTimer = window.setInterval(() => {
+      if (!this.activeRoomId) {
+        this.fetchInitialRooms();
+      }
     }, 2500);
   }
 
-  private send(data: unknown) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
-    } else {
-      // Reconnect if closed
-      this.connect();
-      setTimeout(() => {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify(data));
+  private startRoomPolling(roomId: string) {
+    this.activeRoomId = roomId;
+    if (this.pollingTimer) clearInterval(this.pollingTimer);
+    this.pollingTimer = window.setInterval(async () => {
+      if (!this.activeRoomId || this.activeRoomId !== roomId) {
+        if (this.pollingTimer) clearInterval(this.pollingTimer);
+        return;
+      }
+      try {
+        const res = await fetch(`/api/rooms/${roomId}/state?playerId=${encodeURIComponent(this.activePlayerId)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && data.room) {
+            this.cachedRoomState = {
+              room: data.room,
+              mySeat: data.mySeat,
+              myHand: data.myHand || [],
+              legalCards: data.legalCards || [],
+              forbiddenBid: data.forbiddenBid ?? -1,
+            };
+            this.roomStateListeners.forEach((l) => l(this.cachedRoomState!));
+          }
         }
-      }, 500);
-    }
+      } catch {
+        // Ignore network glitches
+      }
+    }, 1200);
   }
 
   public async fetchInitialRooms(): Promise<RoomListing[]> {
@@ -200,6 +232,10 @@ class RealtimeMultiplayerService {
     return this.cachedRooms;
   }
 
+  public getCachedRoomState(): RoomStatePayload | null {
+    return this.cachedRoomState;
+  }
+
   public subscribeRoomsList(listener: RoomsListListener): () => void {
     this.roomsListListeners.push(listener);
     listener(this.cachedRooms);
@@ -210,6 +246,9 @@ class RealtimeMultiplayerService {
 
   public subscribeRoomState(listener: RoomStateListener): () => void {
     this.roomStateListeners.push(listener);
+    if (this.cachedRoomState) {
+      listener(this.cachedRoomState);
+    }
     return () => {
       this.roomStateListeners = this.roomStateListeners.filter((l) => l !== listener);
     };
@@ -222,7 +261,8 @@ class RealtimeMultiplayerService {
     };
   }
 
-  public createRoom(
+  // Create Room (Hybrid: sends REST and WS)
+  public async createRoom(
     roomName: string,
     password?: string,
     maxPlayers: number = 4,
@@ -231,59 +271,186 @@ class RealtimeMultiplayerService {
       name: 'Tu',
       avatar: '👑',
     }
-  ) {
-    this.send({
+  ): Promise<RoomStatePayload | null> {
+    this.activePlayerId = hostPlayer.id;
+
+    // Send over WS
+    this.sendWs({
       type: 'CREATE_ROOM',
       roomName,
       password: password || undefined,
       maxPlayers,
       hostPlayer,
     });
+
+    // Call REST endpoint
+    try {
+      const res = await fetch('/api/rooms/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomName,
+          password: password || undefined,
+          maxPlayers,
+          hostPlayer,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.room) {
+          const payload: RoomStatePayload = {
+            room: data.room,
+            mySeat: data.mySeat ?? 0,
+            myHand: data.myHand || [],
+            legalCards: data.legalCards || [],
+            forbiddenBid: data.forbiddenBid ?? -1,
+          };
+          this.activeRoomId = data.room.roomId;
+          this.cachedRoomState = payload;
+          this.roomStateListeners.forEach((l) => l(payload));
+          this.startRoomPolling(data.room.roomId);
+          this.fetchInitialRooms();
+          return payload;
+        }
+      }
+    } catch (e) {
+      console.error('HTTP createRoom failed', e);
+    }
+
+    return null;
   }
 
-  public joinRoom(
+  // Join Room (Hybrid)
+  public async joinRoom(
     roomId: string,
     player: { id: string; name: string; avatar?: string },
     password?: string
-  ) {
-    this.send({
+  ): Promise<{ success: boolean; payload?: RoomStatePayload; error?: string }> {
+    this.activePlayerId = player.id;
+
+    // Send over WS
+    this.sendWs({
       type: 'JOIN_ROOM',
       roomId,
       player,
       password: password || undefined,
     });
+
+    // Call REST endpoint
+    try {
+      const res = await fetch(`/api/rooms/${roomId}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          player,
+          password: password || undefined,
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.success && data.room) {
+        const payload: RoomStatePayload = {
+          room: data.room,
+          mySeat: data.mySeat ?? 0,
+          myHand: data.myHand || [],
+          legalCards: data.legalCards || [],
+          forbiddenBid: data.forbiddenBid ?? -1,
+        };
+        this.activeRoomId = roomId;
+        this.cachedRoomState = payload;
+        this.roomStateListeners.forEach((l) => l(payload));
+        this.startRoomPolling(roomId);
+        this.fetchInitialRooms();
+        return { success: true, payload };
+      } else {
+        const errMsg = data.error || 'Nu s-a putut intra în cameră!';
+        this.errorListeners.forEach((l) => l(errMsg));
+        return { success: false, error: errMsg };
+      }
+    } catch {
+      const errMsg = 'Eroare de conexiune la server!';
+      this.errorListeners.forEach((l) => l(errMsg));
+      return { success: false, error: errMsg };
+    }
+  }
+
+  // Action Dispatcher (POST /api/rooms/:id/action + WS)
+  public async sendAction(roomId: string, actionData: Record<string, unknown>) {
+    // Send over WS
+    this.sendWs({
+      roomId,
+      playerId: this.activePlayerId,
+      ...actionData,
+    });
+
+    // Send over REST
+    try {
+      const res = await fetch(`/api/rooms/${roomId}/action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerId: this.activePlayerId,
+          ...actionData,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.room) {
+          const payload: RoomStatePayload = {
+            room: data.room,
+            mySeat: data.mySeat ?? 0,
+            myHand: data.myHand || [],
+            legalCards: data.legalCards || [],
+            forbiddenBid: data.forbiddenBid ?? -1,
+          };
+          this.cachedRoomState = payload;
+          this.roomStateListeners.forEach((l) => l(payload));
+        }
+      }
+    } catch {
+      // Ignored
+    }
   }
 
   public addAi(roomId: string) {
-    this.send({ type: 'ADD_AI', roomId });
+    this.sendAction(roomId, { type: 'ADD_AI' });
   }
 
   public toggleReady(roomId: string, playerId: string) {
-    this.send({ type: 'TOGGLE_READY', roomId, playerId });
+    this.sendAction(roomId, { type: 'TOGGLE_READY', playerId });
   }
 
   public startRoomGame(roomId: string) {
-    this.send({ type: 'START_ROOM_GAME', roomId });
+    this.sendAction(roomId, { type: 'START_ROOM_GAME' });
   }
 
   public startBidding(roomId: string) {
-    this.send({ type: 'START_BIDDING', roomId });
+    this.sendAction(roomId, { type: 'START_BIDDING' });
   }
 
   public placeBid(roomId: string, seatIndex: number, bid: number) {
-    this.send({ type: 'PLACE_BID', roomId, seatIndex, bid });
+    this.sendAction(roomId, { type: 'PLACE_BID', seatIndex, bid });
   }
 
   public playCard(roomId: string, seatIndex: number, card: Card) {
-    this.send({ type: 'PLAY_CARD', roomId, seatIndex, card });
+    this.sendAction(roomId, { type: 'PLAY_CARD', seatIndex, card });
   }
 
   public nextRound(roomId: string) {
-    this.send({ type: 'NEXT_ROUND', roomId });
+    this.sendAction(roomId, { type: 'NEXT_ROUND' });
   }
 
   public leaveRoom(roomId: string, playerId: string) {
-    this.send({ type: 'LEAVE_ROOM', roomId, playerId });
+    this.sendAction(roomId, { type: 'LEAVE_ROOM', playerId });
+    this.activeRoomId = null;
+    this.cachedRoomState = null;
+    if (this.pollingTimer) {
+      clearInterval(this.pollingTimer);
+      this.pollingTimer = null;
+    }
+    this.fetchInitialRooms();
   }
 }
 
