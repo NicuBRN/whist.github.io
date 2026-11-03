@@ -1,3 +1,8 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 import { GameModeType, Card, Suit } from '../game/rules.ts';
 
 export interface RoomPlayer {
@@ -5,9 +10,11 @@ export interface RoomPlayer {
   name: string;
   avatar: string;
   isAi: boolean;
-  seatIndex: number; // 0..3
+  seatIndex: number;
   isReady: boolean;
   score: number;
+  bid?: number | null;
+  tricksWon?: number;
 }
 
 export interface RoomTrickCard {
@@ -21,19 +28,42 @@ export interface RoomSyncState {
   roomName: string;
   hasPassword: boolean;
   password?: string;
-  gameMode: GameModeType;
+  gameMode?: GameModeType;
   hostId: string;
-  status: 'lobby' | 'playing' | 'round_over' | 'game_over';
+  maxPlayers: number;
+  status: 'lobby' | 'playing' | 'round_recap' | 'game_over';
   players: RoomPlayer[];
+  roundsCount?: number;
   currentRoundIdx: number;
-  phase: 'dealing' | 'bidding' | 'playing' | 'trick_won' | 'round_end';
-  currentTurnPlayerId: number;
+  currentRound?: {
+    roundNumber: number;
+    cardCount: number;
+    hasTrump: boolean;
+    dealerIndex: number;
+  } | null;
+  phase: 'dealing' | 'inspecting' | 'bidding' | 'playing' | 'trick_eval' | 'round_recap';
+  currentTurn: number;
   trumpSuit: Suit | null;
   trumpCard: Card | null;
-  bids: (number | null)[];
-  tricksWon: number[];
   currentTrick: RoomTrickCard[];
-  lastTrickWinnerName: string | null;
+  winningCardId?: string | null;
+  trickWinnerBanner?: {
+    winnerName: string;
+    reason: string;
+    winningCard: Card;
+  } | null;
+  statusMessage?: string;
+  history?: Array<{
+    roundNumber: number;
+    cardCount: number;
+    trumpSuit: Suit | null;
+    playerResults: Array<{
+      bid: number | null;
+      tricksWon: number;
+      points: number;
+      runningTotal: number;
+    }>;
+  }>;
   updatedAt: number;
 }
 
@@ -41,107 +71,220 @@ export interface RoomListing {
   id: string;
   name: string;
   hasPassword: boolean;
-  gameMode: GameModeType;
-  hostName: string;
+  hostId: string;
   playerCount: number;
   maxPlayers: number;
-  status: 'lobby' | 'playing';
+  status: 'lobby' | 'playing' | 'round_recap' | 'game_over';
   updatedAt: number;
 }
 
-const STORAGE_ROOMS_KEY = 'romanian_whist_saved_rooms_v1';
-const BROADCAST_CHANNEL_NAME = 'romanian_whist_network';
+type ServerMessage =
+  | { type: 'ROOMS_LIST'; rooms: RoomListing[] }
+  | {
+      type: 'ROOM_STATE';
+      room: RoomSyncState;
+      mySeat: number;
+      myHand: Card[];
+      legalCards: Card[];
+      forbiddenBid: number;
+    }
+  | { type: 'ERROR'; message: string };
 
-type RoomMessage =
-  | { type: 'ROOM_ANNOUNCE'; room: RoomSyncState }
-  | { type: 'ROOM_STATE_UPDATE'; room: RoomSyncState }
-  | { type: 'PLAYER_JOIN'; roomId: string; player: RoomPlayer; passwordAttempt?: string }
-  | { type: 'PLAYER_LEAVE'; roomId: string; playerId: string }
-  | { type: 'PLAYER_READY_TOGGLE'; roomId: string; playerId: string }
-  | { type: 'PLAYER_ACTION'; roomId: string; action: unknown };
+type RoomsListListener = (rooms: RoomListing[]) => void;
+type RoomStateListener = (data: {
+  room: RoomSyncState;
+  mySeat: number;
+  myHand: Card[];
+  legalCards: Card[];
+  forbiddenBid: number;
+}) => void;
+type ErrorListener = (errorMsg: string) => void;
 
-export class MultiplayerNetwork {
-  private channel: BroadcastChannel | null = null;
-  private messageListeners: ((msg: RoomMessage) => void)[] = [];
+class RealtimeMultiplayerService {
+  private ws: WebSocket | null = null;
+  private roomsListListeners: RoomsListListener[] = [];
+  private roomStateListeners: RoomStateListener[] = [];
+  private errorListeners: ErrorListener[] = [];
+  private cachedRooms: RoomListing[] = [];
+  private isConnected = false;
+  private reconnectTimer: number | null = null;
 
   constructor() {
-    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-      try {
-        this.channel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-        this.channel.onmessage = (event) => {
-          this.notifyListeners(event.data);
-        };
-      } catch {
-        this.channel = null;
-      }
-    }
-
     if (typeof window !== 'undefined') {
-      window.addEventListener('storage', (e) => {
-        if (e.key === 'whist_cross_msg' && e.newValue) {
-          try {
-            const data = JSON.parse(e.newValue);
-            this.notifyListeners(data);
-          } catch {}
-        }
-      });
+      this.connect();
+      this.fetchInitialRooms();
     }
   }
 
-  public subscribe(listener: (msg: RoomMessage) => void): () => void {
-    this.messageListeners.push(listener);
+  private connect() {
+    if (typeof window === 'undefined') return;
+    try {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      this.ws = new WebSocket(wsUrl);
+
+      this.ws.onopen = () => {
+        this.isConnected = true;
+        this.send({ type: 'GET_ROOMS' });
+      };
+
+      this.ws.onmessage = (event) => {
+        try {
+          const data: ServerMessage = JSON.parse(event.data);
+          if (data.type === 'ROOMS_LIST') {
+            this.cachedRooms = data.rooms;
+            this.roomsListListeners.forEach((l) => l(data.rooms));
+          } else if (data.type === 'ROOM_STATE') {
+            this.roomStateListeners.forEach((l) => l(data));
+          } else if (data.type === 'ERROR') {
+            this.errorListeners.forEach((l) => l(data.message));
+          }
+        } catch (e) {
+          console.error('Failed to parse WebSocket message', e);
+        }
+      };
+
+      this.ws.onclose = () => {
+        this.isConnected = false;
+        this.scheduleReconnect();
+      };
+
+      this.ws.onerror = () => {
+        this.isConnected = false;
+      };
+    } catch {
+      this.scheduleReconnect();
+    }
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, 2500);
+  }
+
+  private send(data: unknown) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
+    } else {
+      // Reconnect if closed
+      this.connect();
+      setTimeout(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(data));
+        }
+      }, 500);
+    }
+  }
+
+  public async fetchInitialRooms(): Promise<RoomListing[]> {
+    try {
+      const res = await fetch('/api/rooms');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.rooms) {
+          this.cachedRooms = data.rooms;
+          this.roomsListListeners.forEach((l) => l(data.rooms));
+          return data.rooms;
+        }
+      }
+    } catch {
+      // Ignore
+    }
+    return this.cachedRooms;
+  }
+
+  public getCachedRooms(): RoomListing[] {
+    return this.cachedRooms;
+  }
+
+  public subscribeRoomsList(listener: RoomsListListener): () => void {
+    this.roomsListListeners.push(listener);
+    listener(this.cachedRooms);
     return () => {
-      this.messageListeners = this.messageListeners.filter(l => l !== listener);
+      this.roomsListListeners = this.roomsListListeners.filter((l) => l !== listener);
     };
   }
 
-  private notifyListeners(msg: RoomMessage) {
-    for (const listener of this.messageListeners) {
-      try {
-        listener(msg);
-      } catch {}
-    }
+  public subscribeRoomState(listener: RoomStateListener): () => void {
+    this.roomStateListeners.push(listener);
+    return () => {
+      this.roomStateListeners = this.roomStateListeners.filter((l) => l !== listener);
+    };
   }
 
-  public broadcast(msg: RoomMessage) {
-    if (this.channel) {
-      this.channel.postMessage(msg);
-    }
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.setItem('whist_cross_msg', JSON.stringify({ ...msg, _t: Date.now() }));
-      } catch {}
-    }
+  public subscribeErrors(listener: ErrorListener): () => void {
+    this.errorListeners.push(listener);
+    return () => {
+      this.errorListeners = this.errorListeners.filter((l) => l !== listener);
+    };
   }
 
-  // Room Persistence Helpers
-  public static getAllStoredRooms(): Record<string, RoomSyncState> {
-    if (typeof window === 'undefined') return {};
-    try {
-      const raw = localStorage.getItem(STORAGE_ROOMS_KEY);
-      return raw ? JSON.parse(raw) : {};
-    } catch {
-      return {};
+  public createRoom(
+    roomName: string,
+    password?: string,
+    maxPlayers: number = 4,
+    hostPlayer: { id: string; name: string; avatar?: string } = {
+      id: 'host-1',
+      name: 'Tu',
+      avatar: '👑',
     }
+  ) {
+    this.send({
+      type: 'CREATE_ROOM',
+      roomName,
+      password: password || undefined,
+      maxPlayers,
+      hostPlayer,
+    });
   }
 
-  public static saveRoom(room: RoomSyncState) {
-    if (typeof window === 'undefined') return;
-    try {
-      const rooms = MultiplayerNetwork.getAllStoredRooms();
-      rooms[room.roomId] = room;
-      localStorage.setItem(STORAGE_ROOMS_KEY, JSON.stringify(rooms));
-    } catch {}
+  public joinRoom(
+    roomId: string,
+    player: { id: string; name: string; avatar?: string },
+    password?: string
+  ) {
+    this.send({
+      type: 'JOIN_ROOM',
+      roomId,
+      player,
+      password: password || undefined,
+    });
   }
 
-  public static deleteRoom(roomId: string) {
-    if (typeof window === 'undefined') return;
-    try {
-      const rooms = MultiplayerNetwork.getAllStoredRooms();
-      delete rooms[roomId];
-      localStorage.setItem(STORAGE_ROOMS_KEY, JSON.stringify(rooms));
-    } catch {}
+  public addAi(roomId: string) {
+    this.send({ type: 'ADD_AI', roomId });
+  }
+
+  public toggleReady(roomId: string, playerId: string) {
+    this.send({ type: 'TOGGLE_READY', roomId, playerId });
+  }
+
+  public startRoomGame(roomId: string) {
+    this.send({ type: 'START_ROOM_GAME', roomId });
+  }
+
+  public startBidding(roomId: string) {
+    this.send({ type: 'START_BIDDING', roomId });
+  }
+
+  public placeBid(roomId: string, seatIndex: number, bid: number) {
+    this.send({ type: 'PLACE_BID', roomId, seatIndex, bid });
+  }
+
+  public playCard(roomId: string, seatIndex: number, card: Card) {
+    this.send({ type: 'PLAY_CARD', roomId, seatIndex, card });
+  }
+
+  public nextRound(roomId: string) {
+    this.send({ type: 'NEXT_ROUND', roomId });
+  }
+
+  public leaveRoom(roomId: string, playerId: string) {
+    this.send({ type: 'LEAVE_ROOM', roomId, playerId });
   }
 }
 
-export const multiplayerNet = new MultiplayerNetwork();
+export const multiplayerService = new RealtimeMultiplayerService();

@@ -23,7 +23,7 @@ import {
   RANK_NAMES_RO,
 } from './game/rules.ts';
 import { sounds } from './utils/audio.ts';
-import { RoomSyncState } from './utils/multiplayer.ts';
+import { RoomSyncState, multiplayerService } from './utils/multiplayer.ts';
 import { downloadStandaloneHtml } from './utils/exportStandalone.ts';
 
 // Components
@@ -167,6 +167,83 @@ export default function App() {
   const [turnCountdown, setTurnCountdown] = useState<number>(7);
   const [turnAutoPlayedCard, setTurnAutoPlayedCard] = useState<Card | null>(null);
 
+  // User ID for multiplayer (persisted across sessions)
+  const [userId] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      let saved = localStorage.getItem('whist_user_id');
+      if (!saved) {
+        saved = 'user-' + Math.random().toString(36).substring(2, 9);
+        localStorage.setItem('whist_user_id', saved);
+      }
+      return saved;
+    }
+    return 'user-1';
+  });
+
+  // Online Multiplayer State
+  const [onlineRoom, setOnlineRoom] = useState<RoomSyncState | null>(null);
+  const [onlineSeat, setOnlineSeat] = useState<number>(0);
+  const [onlineHand, setOnlineHand] = useState<Card[]>([]);
+  const [onlineLegalCards, setOnlineLegalCards] = useState<Card[]>([]);
+  const [onlineForbiddenBid, setOnlineForbiddenBid] = useState<number>(-1);
+
+  // Subscribe to real-time online room state
+  useEffect(() => {
+    const unsub = multiplayerService.subscribeRoomState((data) => {
+      setOnlineRoom(data.room);
+      setOnlineSeat(data.mySeat);
+      setOnlineHand(data.myHand || []);
+      setOnlineLegalCards(data.legalCards || []);
+      setOnlineForbiddenBid(data.forbiddenBid ?? -1);
+
+      if (data.room.status === 'playing') {
+        setShowLobbyModal(false);
+        setGameState('playing');
+        setPlayerCount(data.room.players.length);
+        setRoundPhase(data.room.phase);
+        setCurrentTurn(data.room.currentTurn);
+        if (data.room.currentTurn === data.mySeat && data.room.phase === 'playing') {
+          setTurnCountdown(7);
+        }
+        if (data.room.trumpCard) {
+          setTrumpCard(data.room.trumpCard);
+          setTrumpSuit(data.room.trumpSuit);
+        } else {
+          setTrumpCard(null);
+          setTrumpSuit(null);
+        }
+        if (data.room.trickWinnerBanner) {
+          setTrickWinnerBanner(data.room.trickWinnerBanner);
+          setWinningCardId(data.room.winningCardId || null);
+        } else {
+          setTrickWinnerBanner(null);
+          setWinningCardId(null);
+        }
+        if (data.room.statusMessage) {
+          setStatusMessage(data.room.statusMessage);
+        }
+        if (data.room.currentRoundIdx !== undefined) {
+          setCurrentRoundIdx(data.room.currentRoundIdx);
+        }
+        const mappedPlayers: PlayerState[] = data.room.players.map((p, idx) => ({
+          id: idx,
+          name: p.name,
+          avatar: p.avatar,
+          isAi: p.isAi,
+          score: p.score,
+          bid: p.bid ?? null,
+          tricksWon: p.tricksWon ?? 0,
+        }));
+        setPlayers(mappedPlayers);
+        playersRef.current = mappedPlayers;
+      } else if (data.room.status === 'game_over') {
+        setGameState('gameover');
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
   // Sync state to body dataset for ultra-mode compliance
   useEffect(() => {
     document.body.dataset.state = gameState;
@@ -245,33 +322,25 @@ export default function App() {
   );
 
   // Start a Room game
-  const handleStartRoomGame = (room: RoomSyncState) => {
+  const handleStartRoomGame = (room: RoomSyncState, mySeat: number = 0) => {
     setShowLobbyModal(false);
-    const count = Math.min(6, Math.max(3, room.players.length || 4));
-    setPlayerCount(count);
+    setOnlineRoom(room);
+    setOnlineSeat(mySeat);
+    setGameState('playing');
+    setPlayerCount(room.players.length || 4);
 
-    const mappedPlayers: PlayerState[] = room.players.slice(0, count).map((p, idx) => ({
+    const mappedPlayers: PlayerState[] = room.players.map((p, idx) => ({
       id: idx,
       name: p.name,
       avatar: p.avatar,
       isAi: p.isAi,
-      score: 0,
-      bid: null,
-      tricksWon: 0,
+      score: p.score || 0,
+      bid: p.bid ?? null,
+      tricksWon: p.tricksWon ?? 0,
     }));
 
     playersRef.current = mappedPlayers;
     setPlayers(mappedPlayers);
-    setTricksCompletedInRound(0);
-    tricksCompletedInRoundRef.current = 0;
-    const generated = generateRounds(count);
-    setRounds(generated);
-    setCurrentRoundIdx(0);
-    setHistory([]);
-    setGameState('playing');
-    setRecapResults(null);
-    setWinningCardId(null);
-    initRound(0, generated, mappedPlayers, count);
   };
 
   // Initialize a new round
@@ -355,6 +424,12 @@ export default function App() {
     if (roundPhase !== 'inspecting') return;
     setCountdown(0);
     sounds.playBid();
+
+    if (onlineRoom) {
+      multiplayerService.startBidding(onlineRoom.roomId);
+      return;
+    }
+
     setRoundPhase('bidding');
 
     const round = rounds[currentRoundIdx];
@@ -370,7 +445,7 @@ export default function App() {
         `Se licitează pentru Runda ${currentRoundIdx + 1}! Începe ${firstBidderName}.`
       );
     }
-  }, [roundPhase, rounds, currentRoundIdx, playerCount, players]);
+  }, [roundPhase, rounds, currentRoundIdx, playerCount, players, onlineRoom]);
 
   // 5-second countdown timer for inspecting phase
   useEffect(() => {
@@ -399,6 +474,7 @@ export default function App() {
 
   // AI Bidding Turn automation
   useEffect(() => {
+    if (onlineRoom) return; // Server handles AI bids in online multiplayer
     if (gameState !== 'playing' || roundPhase !== 'bidding') return;
     if (rounds.length === 0 || currentRoundIdx >= rounds.length) return;
 
@@ -425,10 +501,15 @@ export default function App() {
 
       return () => clearTimeout(timer);
     }
-  }, [gameState, roundPhase, currentTurn, players, rounds, currentRoundIdx, hands, trumpSuit]);
+  }, [gameState, roundPhase, currentTurn, players, rounds, currentRoundIdx, hands, trumpSuit, onlineRoom]);
 
   // Handle a bid placed by either User or AI
   const handleBidPlaced = (playerIdx: number, bid: number) => {
+    if (onlineRoom) {
+      multiplayerService.placeBid(onlineRoom.roomId, onlineSeat, bid);
+      return;
+    }
+
     const currentList = playersRef.current.length > 0 ? playersRef.current : players;
     const updatedPlayers = currentList.map((p) =>
       p.id === playerIdx ? { ...p, bid } : p
@@ -468,6 +549,7 @@ export default function App() {
 
   // AI Card Play automation
   useEffect(() => {
+    if (onlineRoom) return; // Server handles AI card play in online multiplayer
     if (gameState !== 'playing' || roundPhase !== 'playing') return;
     if (currentTrick.length === playerCount) return;
 
@@ -479,7 +561,7 @@ export default function App() {
 
       return () => clearTimeout(timer);
     }
-  }, [gameState, roundPhase, currentTurn, currentTrick, players, playerCount]);
+  }, [gameState, roundPhase, currentTurn, currentTrick, players, playerCount, onlineRoom]);
 
   // Execute AI card play
   const executeAiCardPlay = (playerIdx: number) => {
@@ -505,12 +587,30 @@ export default function App() {
 
   // Human card play countdown timer (7 seconds to play card)
   useEffect(() => {
-    if (gameState !== 'playing' || roundPhase !== 'playing' || currentTurn !== 0) {
+    const isHumanTurn = onlineRoom
+      ? onlineRoom.phase === 'playing' && onlineRoom.currentTurn === onlineSeat
+      : gameState === 'playing' && roundPhase === 'playing' && currentTurn === 0;
+
+    if (!isHumanTurn) {
       return;
     }
 
     if (turnCountdown <= 0) {
       // Auto-play first legal card in order
+      if (onlineRoom) {
+        if (onlineLegalCards.length > 0) {
+          const cardToPlay = onlineLegalCards[0];
+          setTurnAutoPlayedCard(cardToPlay);
+          setTimeout(() => setTurnAutoPlayedCard(null), 3000);
+          setStatusMessage(
+            `⏱️ Timpul a expirat (7s)! A fost jucată automat prima carte legală: ${RANK_NAMES_RO[cardToPlay.rank]} de ${SUIT_NAMES_RO[cardToPlay.suit]}.`
+          );
+          sounds.playCardPlay();
+          multiplayerService.playCard(onlineRoom.roomId, onlineSeat, cardToPlay);
+        }
+        return;
+      }
+
       const userHand = handsRef.current[0] || hands[0] || [];
       const trickForRules = currentTrick.map((t) => ({ playerId: t.playerId, card: t.card }));
       const legalCards = getLegalCards(userHand, trickForRules, trumpSuit, true);
@@ -537,10 +637,35 @@ export default function App() {
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [gameState, roundPhase, currentTurn, turnCountdown, currentTrick, trumpSuit, hands]);
+  }, [
+    gameState,
+    roundPhase,
+    currentTurn,
+    turnCountdown,
+    currentTrick,
+    trumpSuit,
+    hands,
+    onlineRoom,
+    onlineSeat,
+    onlineLegalCards,
+  ]);
 
   // Handle Human Card Click
   const handleUserCardClick = (card: Card) => {
+    if (onlineRoom) {
+      if (onlineRoom.phase !== 'playing' || onlineRoom.currentTurn !== onlineSeat) return;
+      const isLegal = onlineLegalCards.some((c) => c.id === card.id);
+      if (!isLegal) {
+        sounds.playForbidden();
+        setStatusMessage('Trebuie să dai la culoare sau să tai cu atu!');
+        return;
+      }
+      sounds.playCardPlay();
+      setTurnCountdown(7);
+      multiplayerService.playCard(onlineRoom.roomId, onlineSeat, card);
+      return;
+    }
+
     if (roundPhase !== 'playing' || currentTurn !== 0) return;
 
     const userHand = hands[0];
@@ -758,6 +883,10 @@ export default function App() {
 
   // User manually proceeds to next round from the recap modal
   const handleProceedToNextRound = () => {
+    if (onlineRoom) {
+      multiplayerService.nextRound(onlineRoom.roomId);
+      return;
+    }
     setRecapResults(null);
     const nextRoundIdx = currentRoundIdx + 1;
     if (nextRoundIdx < rounds.length) {
@@ -1099,13 +1228,21 @@ export default function App() {
                 unlockedJokersCount={CustomizationManager.getUnlockedJokers(stats).length}
                 totalJokersCount={JOKERS_LIST.length}
                 soundEnabled={soundEnabled}
+                isOnlineRoom={!!onlineRoom}
+                onOpenMultiplayer={() => setShowLobbyModal(true)}
                 onToggleSound={toggleSound}
                 onOpenScore={() => setShowScoreModal(true)}
                 onOpenJokers={() => setShowJokersModal(true)}
                 onOpenStats={() => setShowStatsModal(true)}
                 onOpenTutorial={() => setShowTutorialModal(true)}
                 onOpenRules={() => setShowRulesModal(true)}
-                onRestartGame={() => startGame()}
+                onRestartGame={() => {
+                  if (onlineRoom) {
+                    multiplayerService.leaveRoom(onlineRoom.roomId, userId);
+                    setOnlineRoom(null);
+                  }
+                  startGame();
+                }}
                 onDownloadStandalone={downloadStandaloneHtml}
               />
             </div>
@@ -1140,8 +1277,6 @@ export default function App() {
                         )}
                       </div>
                       <div className="text-[10px] sm:text-xs text-slate-300 flex items-center gap-1.5 font-mono">
-                        <span className="text-amber-300 font-bold">{p.score} pct</span>
-                        <span>•</span>
                         <span>
                           Lic: <strong>{p.bid !== null ? p.bid : '-'}</strong> | F:{' '}
                           <strong className="text-emerald-400">{p.tricksWon}</strong>
@@ -1193,7 +1328,7 @@ export default function App() {
 
               {/* Cards in the Current Trick */}
               <div className="relative flex flex-wrap items-center justify-center gap-1.5 sm:gap-3 p-2 sm:p-4 z-20 max-w-[260px] sm:max-w-[340px]">
-                {currentTrick.map((item) => {
+                {(onlineRoom ? onlineRoom.currentTrick : currentTrick).map((item) => {
                   const isWinning = winningCardId === item.card.id;
                   return (
                     <div
@@ -1206,7 +1341,7 @@ export default function App() {
                         isWinningCard={isWinning}
                       />
                       <span className="text-[9px] sm:text-[10px] font-bold text-slate-200 mt-0.5 bg-black/60 px-1.5 rounded-full border border-slate-700 shadow">
-                        {item.playerId === 0 ? 'Tu' : item.playerName.split(' ')[0]}
+                        {item.playerId === (onlineRoom ? onlineSeat : 0) ? 'Tu' : item.playerName.split(' ')[0]}
                       </span>
                     </div>
                   );
@@ -1227,7 +1362,7 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                currentTrick.length === 0 && (
+                (onlineRoom ? (onlineRoom.currentTrick?.length ?? 0) === 0 : currentTrick.length === 0) && (
                   <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                     <div className="text-center text-xs text-amber-200/70 px-4 max-w-[200px] font-medium">
                       {statusMessage}
@@ -1243,42 +1378,79 @@ export default function App() {
             {/* User Info Bar */}
             <div
               className={`mb-1.5 px-4 py-1.5 rounded-full border flex items-center gap-3 backdrop-blur-xs transition-all ${
-                currentTurn === 0 && roundPhase === 'playing'
+                (onlineRoom ? onlineRoom.currentTurn === onlineSeat && onlineRoom.phase === 'playing' : currentTurn === 0 && roundPhase === 'playing')
                   ? 'bg-amber-950/85 border-amber-400 ring-2 ring-amber-400/60 shadow-lg shadow-amber-500/20'
                   : 'bg-slate-950/80 border-emerald-900/60'
               }`}
             >
-              <span className="text-lg">{players[0]?.avatar || '😎'}</span>
-              <span className="font-bold text-xs sm:text-sm text-slate-100">
-                {players[0]?.name || 'Tu'}
+              <span className="text-lg">
+                {onlineRoom ? onlineRoom.players[onlineSeat]?.avatar || '😎' : players[0]?.avatar || '😎'}
               </span>
-              {currentRound?.dealerIndex === 0 && (
+              <span className="font-bold text-xs sm:text-sm text-slate-100">
+                {onlineRoom ? `${onlineRoom.players[onlineSeat]?.name || 'Tu'} (Tu)` : players[0]?.name || 'Tu'}
+              </span>
+              {currentRound?.dealerIndex === (onlineRoom ? onlineSeat : 0) && (
                 <span className="text-[9px] bg-amber-500 text-slate-950 px-1.5 py-0.2 rounded font-black">
                   Tu ești Dealer
                 </span>
               )}
-              <div className="text-xs text-amber-300 font-bold font-mono">
-                {players[0]?.score > 0 ? `+${players[0]?.score}` : players[0]?.score ?? 0} pct
-              </div>
-              <div className="text-xs text-slate-300 border-l border-slate-700 pl-2">
+              <div className="text-xs text-slate-300 font-mono">
                 Licitație:{' '}
                 <strong className="text-amber-400">
-                  {players[0]?.bid !== null ? players[0]?.bid : '-'}
+                  {onlineRoom
+                    ? onlineRoom.players[onlineSeat]?.bid !== null && onlineRoom.players[onlineSeat]?.bid !== undefined
+                      ? onlineRoom.players[onlineSeat]?.bid
+                      : '-'
+                    : players[0]?.bid !== null
+                    ? players[0]?.bid
+                    : '-'}
                 </strong>{' '}
                 | Făcute:{' '}
-                <strong className="text-emerald-400">{players[0]?.tricksWon ?? 0}</strong>
+                <strong className="text-emerald-400">
+                  {onlineRoom ? onlineRoom.players[onlineSeat]?.tricksWon ?? 0 : players[0]?.tricksWon ?? 0}
+                </strong>
               </div>
             </div>
 
-            {/* Hand Cards Tray */}
+            {/* 7-Second Turn Timer for Playing Card */}
+            {(onlineRoom
+              ? onlineRoom.phase === 'playing' && onlineRoom.currentTurn === onlineSeat
+              : currentTurn === 0 && roundPhase === 'playing') && (
+              <div
+                className={`mb-1.5 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1.5 transition-all shadow-md ${
+                  turnCountdown <= 3
+                    ? 'bg-red-950/90 text-red-300 border border-red-500/80 ring-2 ring-red-500/50 animate-pulse'
+                    : 'bg-amber-950/90 text-amber-300 border border-amber-500/80 ring-1 ring-amber-400/40'
+                }`}
+              >
+                <Clock className="w-3.5 h-3.5" />
+                <span>Rândul tău! Pune o carte în {turnCountdown}s</span>
+                {turnCountdown <= 3 && (
+                  <span className="text-[10px] text-red-300 font-normal">
+                    (se va da automat prima carte la expirare)
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Auto-played Notification Toast */}
+            {turnAutoPlayedCard && (
+              <div className="mb-1.5 px-3 py-1 bg-amber-500 text-slate-950 text-xs font-bold rounded-lg shadow-lg animate-in zoom-in-95">
+                ⏱️ Timp expirat (7s)! A fost jucată automat prima carte din mână.
+              </div>
+            )}
+
             {/* Hand Cards Tray */}
             <div className="w-full max-w-4xl flex items-center justify-center overflow-x-auto py-1.5 px-3 hide-scrollbar touch-pan-x">
               <div className="flex justify-center -space-x-1.5 sm:-space-x-3 md:-space-x-4 pb-1">
-                {(hands[0] || []).map((card) => {
-                  const isPlayable =
-                    roundPhase === 'playing' &&
-                    currentTurn === 0 &&
-                    humanLegalCards.some((c) => c.id === card.id);
+                {(onlineRoom ? onlineHand : hands[0] || []).map((card) => {
+                  const isPlayable = onlineRoom
+                    ? onlineRoom.phase === 'playing' &&
+                      onlineRoom.currentTurn === onlineSeat &&
+                      onlineLegalCards.some((c) => c.id === card.id)
+                    : roundPhase === 'playing' &&
+                      currentTurn === 0 &&
+                      humanLegalCards.some((c) => c.id === card.id);
 
                   return (
                     <PlayingCard
@@ -1376,23 +1548,43 @@ export default function App() {
           </div>
 
           {/* Bidding Overlay Modal (Active during entire bidding phase) */}
-          {roundPhase === 'bidding' && currentRound && (
+          {(onlineRoom ? onlineRoom.phase === 'bidding' : roundPhase === 'bidding') && (currentRound || onlineRoom?.currentRound) && (
             <BiddingOverlay
-              cardCount={currentRound.cardCount}
-              trumpSuit={trumpSuit}
-              dealerName={(playersRef.current.length > 0 ? playersRef.current : players)[currentRound.dealerIndex]?.name || ''}
-              isUserDealer={currentRound.dealerIndex === 0}
-              forbiddenBid={userForbiddenBid}
-              bidsSummary={(playersRef.current.length > 0 ? playersRef.current : players).map((p) => ({
+              cardCount={onlineRoom?.currentRound?.cardCount ?? currentRound?.cardCount ?? 1}
+              trumpSuit={onlineRoom ? onlineRoom.trumpSuit : trumpSuit}
+              dealerName={
+                onlineRoom
+                  ? onlineRoom.players[onlineRoom.currentRound?.dealerIndex ?? 0]?.name || ''
+                  : (playersRef.current.length > 0 ? playersRef.current : players)[currentRound?.dealerIndex ?? 0]?.name || ''
+              }
+              isUserDealer={
+                onlineRoom
+                  ? (onlineRoom.currentRound?.dealerIndex ?? 0) === onlineSeat
+                  : currentRound?.dealerIndex === 0
+              }
+              forbiddenBid={onlineRoom ? onlineForbiddenBid : userForbiddenBid}
+              bidsSummary={(onlineRoom ? onlineRoom.players : (playersRef.current.length > 0 ? playersRef.current : players)).map((p) => ({
                 name: p.name,
-                bid: p.bid,
+                bid: p.bid ?? null,
               }))}
-              userHand={hands[0] || []}
-              onSelectBid={(val) => handleBidPlaced(0, val)}
-              isWaitingForTurn={currentTurn !== 0}
-              currentBidderName={(playersRef.current.length > 0 ? playersRef.current : players)[currentTurn]?.name || ''}
-              userHasBid={(playersRef.current.length > 0 ? playersRef.current : players)[0]?.bid !== null}
-              userPlacedBid={(playersRef.current.length > 0 ? playersRef.current : players)[0]?.bid}
+              userHand={onlineRoom ? onlineHand : (hands[0] || [])}
+              onSelectBid={(val) => handleBidPlaced(onlineRoom ? onlineSeat : 0, val)}
+              isWaitingForTurn={onlineRoom ? onlineRoom.currentTurn !== onlineSeat : currentTurn !== 0}
+              currentBidderName={
+                onlineRoom
+                  ? onlineRoom.players[onlineRoom.currentTurn]?.name || ''
+                  : (playersRef.current.length > 0 ? playersRef.current : players)[currentTurn]?.name || ''
+              }
+              userHasBid={
+                onlineRoom
+                  ? onlineRoom.players[onlineSeat]?.bid !== null && onlineRoom.players[onlineSeat]?.bid !== undefined
+                  : (playersRef.current.length > 0 ? playersRef.current : players)[0]?.bid !== null
+              }
+              userPlacedBid={
+                onlineRoom
+                  ? onlineRoom.players[onlineSeat]?.bid ?? null
+                  : (playersRef.current.length > 0 ? playersRef.current : players)[0]?.bid
+              }
             />
           )}
 
@@ -1459,7 +1651,7 @@ export default function App() {
       {/* Multiplayer Lobby Modal */}
       {showLobbyModal && (
         <MultiplayerLobbyModal
-          currentUserId="human-0"
+          currentUserId={userId}
           currentUserName={userName}
           onStartRoomGame={handleStartRoomGame}
           onClose={() => setShowLobbyModal(false)}

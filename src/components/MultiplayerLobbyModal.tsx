@@ -1,12 +1,34 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 import React, { useState, useEffect } from 'react';
-import { GameModeType } from '../game/rules.ts';
-import { RoomSyncState, RoomPlayer, MultiplayerNetwork } from '../utils/multiplayer.ts';
-import { X, Users, Lock, KeyRound, Plus, Play, UserCheck, Bot, Copy, Check } from 'lucide-react';
+import {
+  RoomSyncState,
+  RoomListing,
+  multiplayerService,
+} from '../utils/multiplayer.ts';
+import {
+  X,
+  Users,
+  Lock,
+  KeyRound,
+  Plus,
+  Play,
+  UserCheck,
+  Bot,
+  Copy,
+  Check,
+  Globe,
+  RefreshCw,
+  AlertCircle,
+} from 'lucide-react';
 
 interface MultiplayerLobbyModalProps {
   currentUserId: string;
   currentUserName: string;
-  onStartRoomGame: (room: RoomSyncState) => void;
+  onStartRoomGame: (room: RoomSyncState, mySeat: number) => void;
   onClose: () => void;
 }
 
@@ -17,91 +39,81 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
   onClose,
 }) => {
   const [activeTab, setActiveTab] = useState<'browse' | 'create' | 'in_room'>('browse');
-  const [rooms, setRooms] = useState<Record<string, RoomSyncState>>({});
+  const [roomsList, setRoomsList] = useState<RoomListing[]>([]);
   const [currentRoom, setCurrentRoom] = useState<RoomSyncState | null>(null);
+  const [mySeat, setMySeat] = useState<number>(0);
 
   // Form states for creating a room
-  const [createName, setCreateName] = useState('Masa de Whist');
+  const [createName, setCreateName] = useState('Masa de Whist Românesc');
   const [createPassword, setCreatePassword] = useState('');
-  const [createMode, setCreateMode] = useState<GameModeType>('standard');
+  const [createMaxPlayers, setCreateMaxPlayers] = useState<number>(4);
 
   // Form states for joining
   const [joinRoomId, setJoinRoomId] = useState('');
   const [joinPassword, setJoinPassword] = useState('');
-  const [joinError, setJoinError] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
   const [copiedCode, setCopiedCode] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
-  // Load existing rooms
+  // Setup WebSocket room listings and active room sync
   useEffect(() => {
-    const refreshRooms = () => {
-      setRooms(MultiplayerNetwork.getAllStoredRooms());
-    };
-    refreshRooms();
-    const interval = setInterval(refreshRooms, 1500);
-    return () => clearInterval(interval);
-  }, []);
+    const unsubRooms = multiplayerService.subscribeRoomsList((rooms) => {
+      setRoomsList(rooms);
+    });
 
-  // Listen for room updates
-  useEffect(() => {
-    const handleStorageChange = () => {
-      const all = MultiplayerNetwork.getAllStoredRooms();
-      setRooms(all);
-      if (currentRoom && all[currentRoom.roomId]) {
-        setCurrentRoom(all[currentRoom.roomId]);
+    const unsubRoom = multiplayerService.subscribeRoomState((data) => {
+      setCurrentRoom(data.room);
+      setMySeat(data.mySeat);
+      if (data.room.status === 'playing') {
+        onStartRoomGame(data.room, data.mySeat);
       }
+    });
+
+    const unsubErrors = multiplayerService.subscribeErrors((msg) => {
+      setErrorMessage(msg);
+    });
+
+    multiplayerService.fetchInitialRooms();
+
+    return () => {
+      unsubRooms();
+      unsubRoom();
+      unsubErrors();
     };
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
-  }, [currentRoom]);
+  }, [onStartRoomGame]);
+
+  const handleManualRefresh = async () => {
+    setIsRefreshing(true);
+    await multiplayerService.fetchInitialRooms();
+    setTimeout(() => setIsRefreshing(false), 500);
+  };
 
   // Create room handler
   const handleCreateRoom = (e: React.FormEvent) => {
     e.preventDefault();
-    const randomCode = `WHIST-${Math.floor(1000 + Math.random() * 9000)}`;
-    const hostPlayer: RoomPlayer = {
-      id: currentUserId,
-      name: currentUserName || 'Tu (Gazdă)',
-      avatar: '👑',
-      isAi: false,
-      seatIndex: 0,
-      isReady: true,
-      score: 0,
-    };
-
-    const newRoom: RoomSyncState = {
-      roomId: randomCode,
-      roomName: createName.trim() || 'Masa de Whist',
-      hasPassword: createPassword.trim().length > 0,
-      password: createPassword.trim() || undefined,
-      gameMode: createMode,
-      hostId: currentUserId,
-      status: 'lobby',
-      players: [hostPlayer],
-      currentRoundIdx: 0,
-      phase: 'dealing',
-      currentTurnPlayerId: 0,
-      trumpSuit: null,
-      trumpCard: null,
-      bids: [null, null, null, null],
-      tricksWon: [0, 0, 0, 0],
-      currentTrick: [],
-      lastTrickWinnerName: null,
-      updatedAt: Date.now(),
-    };
-
-    MultiplayerNetwork.saveRoom(newRoom);
-    setCurrentRoom(newRoom);
+    setErrorMessage('');
+    multiplayerService.createRoom(
+      createName.trim() || 'Masa de Whist Românesc',
+      createPassword.trim() || undefined,
+      createMaxPlayers,
+      {
+        id: currentUserId,
+        name: currentUserName.trim() || 'Tu',
+        avatar: '👑',
+      }
+    );
     setActiveTab('in_room');
   };
 
-  // Join room handler
-  const handleJoinRoom = (room: RoomSyncState) => {
+  // Join room initiation
+  const handleJoinRoomClick = (room: RoomListing) => {
+    setErrorMessage('');
     if (room.hasPassword) {
-      setJoinRoomId(room.roomId);
-      setJoinError('');
+      setJoinRoomId(room.id);
+      setJoinPassword('');
       return;
     }
-    executeJoin(room.roomId, '');
+    executeJoin(room.id, '');
   };
 
   const handlePasswordSubmit = (e: React.FormEvent) => {
@@ -110,96 +122,45 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
   };
 
   const executeJoin = (roomId: string, pass: string) => {
-    const target = rooms[roomId];
-    if (!target) {
-      setJoinError('Camera nu a fost găsită!');
-      return;
-    }
-    if (target.hasPassword && target.password !== pass) {
-      setJoinError('Parolă incorectă!');
-      return;
-    }
-    if (target.players.length >= 4) {
-      setJoinError('Camera este plină (4/4 jucători)!');
-      return;
-    }
-
-    // Add player
-    const existing = target.players.find(p => p.id === currentUserId);
-    if (!existing) {
-      const newPlayer: RoomPlayer = {
+    setErrorMessage('');
+    multiplayerService.joinRoom(
+      roomId,
+      {
         id: currentUserId,
-        name: currentUserName || `Jucător ${target.players.length + 1}`,
-        avatar: '👤',
-        isAi: false,
-        seatIndex: target.players.length,
-        isReady: false,
-        score: 0,
-      };
-      target.players.push(newPlayer);
-      target.updatedAt = Date.now();
-      MultiplayerNetwork.saveRoom(target);
-    }
-    setCurrentRoom(target);
+        name: currentUserName.trim() || 'Jucător',
+        avatar: '😎',
+      },
+      pass
+    );
     setActiveTab('in_room');
-    setJoinError('');
   };
 
   // Add AI bot to room
   const handleAddAi = () => {
-    if (!currentRoom || currentRoom.players.length >= 4) return;
-    const aiNames = ['Radu (AI)', 'Elena (AI)', 'Mihai (AI)', 'Andreea (AI)', 'Vlad (AI)'];
-    const usedNames = currentRoom.players.map(p => p.name);
-    const availableName = aiNames.find(n => !usedNames.includes(n)) || `Robot ${currentRoom.players.length + 1}`;
-
-    const updatedRoom: RoomSyncState = {
-      ...currentRoom,
-      players: [
-        ...currentRoom.players,
-        {
-          id: `ai-${Date.now()}-${Math.random()}`,
-          name: availableName,
-          avatar: '🤖',
-          isAi: true,
-          seatIndex: currentRoom.players.length,
-          isReady: true,
-          score: 0,
-        },
-      ],
-      updatedAt: Date.now(),
-    };
-    MultiplayerNetwork.saveRoom(updatedRoom);
-    setCurrentRoom(updatedRoom);
+    if (!currentRoom) return;
+    multiplayerService.addAi(currentRoom.roomId);
   };
 
-  // Toggle ready
+  // Toggle ready status
   const handleToggleReady = () => {
     if (!currentRoom) return;
-    const updatedPlayers = currentRoom.players.map(p => {
-      if (p.id === currentUserId) {
-        return { ...p, isReady: !p.isReady };
-      }
-      return p;
-    });
-    const updatedRoom: RoomSyncState = {
-      ...currentRoom,
-      players: updatedPlayers,
-      updatedAt: Date.now(),
-    };
-    MultiplayerNetwork.saveRoom(updatedRoom);
-    setCurrentRoom(updatedRoom);
+    multiplayerService.toggleReady(currentRoom.roomId, currentUserId);
   };
 
   // Start game from room
   const handleLaunchGame = () => {
-    if (!currentRoom || currentRoom.players.length < 4) return;
-    const updatedRoom: RoomSyncState = {
-      ...currentRoom,
-      status: 'playing',
-      updatedAt: Date.now(),
-    };
-    MultiplayerNetwork.saveRoom(updatedRoom);
-    onStartRoomGame(updatedRoom);
+    if (!currentRoom) return;
+    multiplayerService.startRoomGame(currentRoom.roomId);
+  };
+
+  const handleLeaveRoom = () => {
+    if (currentRoom) {
+      multiplayerService.leaveRoom(currentRoom.roomId, currentUserId);
+      setCurrentRoom(null);
+    }
+    setActiveTab('browse');
+    setJoinRoomId('');
+    setErrorMessage('');
   };
 
   const handleCopyCode = () => {
@@ -209,16 +170,23 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
+  const maxSlots = currentRoom ? currentRoom.maxPlayers || 4 : 4;
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/80 backdrop-blur-xs animate-in fade-in duration-150">
-      <div className="bg-gradient-to-b from-slate-900 via-emerald-950 to-slate-950 border border-amber-500/50 rounded-2xl max-w-2xl w-full max-h-[90vh] flex flex-col shadow-2xl text-slate-100 overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-5 bg-black/85 backdrop-blur-xs animate-in fade-in duration-150">
+      <div className="bg-gradient-to-b from-slate-900 via-emerald-950 to-slate-950 border border-amber-500/50 rounded-2xl max-w-2xl w-full max-h-[92vh] flex flex-col shadow-2xl text-slate-100 overflow-hidden">
         {/* Header */}
-        <div className="px-5 py-4 border-b border-emerald-800/60 flex items-center justify-between bg-slate-950/80">
+        <div className="px-4 sm:px-5 py-3.5 border-b border-emerald-800/60 flex items-center justify-between bg-slate-950/85">
           <div className="flex items-center gap-2.5">
-            <Users className="w-5 h-5 text-amber-400" />
-            <h2 className="text-lg sm:text-xl font-bold font-cinzel text-amber-400">
-              Camere Multiplayer cu Parolă
-            </h2>
+            <Globe className="w-5 h-5 text-amber-400 animate-pulse" />
+            <div>
+              <h2 className="text-base sm:text-lg font-bold font-cinzel text-amber-300">
+                Multiplayer Online (Peste Tot)
+              </h2>
+              <div className="text-[10px] sm:text-xs text-emerald-400 font-mono">
+                Camere în timp real pe Internet • Telefon / Tabletă / PC
+              </div>
+            </div>
           </div>
           <button
             type="button"
@@ -230,42 +198,60 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
           </button>
         </div>
 
+        {/* Global Error Banner */}
+        {errorMessage && (
+          <div className="px-4 py-2 bg-red-950/80 border-b border-red-500/50 text-red-300 text-xs flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+            <span>{errorMessage}</span>
+          </div>
+        )}
+
         {/* Tabs if not in room */}
         {activeTab !== 'in_room' && (
           <div className="flex border-b border-emerald-900/60 bg-slate-950/60">
             <button
               type="button"
-              onClick={() => setActiveTab('browse')}
+              onClick={() => {
+                setActiveTab('browse');
+                setJoinRoomId('');
+                setErrorMessage('');
+              }}
               className={`flex-1 py-3 text-xs sm:text-sm font-bold border-b-2 transition-all cursor-pointer ${
                 activeTab === 'browse'
                   ? 'border-amber-400 text-amber-300 bg-amber-500/10'
                   : 'border-transparent text-slate-400 hover:text-slate-200'
               }`}
             >
-              Camere Active
+              Camere Publice & Private ({roomsList.length})
             </button>
             <button
               type="button"
-              onClick={() => setActiveTab('create')}
+              onClick={() => {
+                setActiveTab('create');
+                setErrorMessage('');
+              }}
               className={`flex-1 py-3 text-xs sm:text-sm font-bold border-b-2 transition-all cursor-pointer ${
                 activeTab === 'create'
                   ? 'border-amber-400 text-amber-300 bg-amber-500/10'
                   : 'border-transparent text-slate-400 hover:text-slate-200'
               }`}
             >
-              + Creează Cameră Nouă
+              + Creează Masă Nouă
             </button>
           </div>
         )}
 
         {/* Content Body */}
-        <div className="flex-1 overflow-auto p-4 sm:p-6">
+        <div className="flex-1 overflow-auto p-4 sm:p-5">
           {/* TAB 1: Browse / Join Rooms */}
           {activeTab === 'browse' && (
             <div className="space-y-4">
               {joinRoomId ? (
                 /* Password Entry Form */
-                <form onSubmit={handlePasswordSubmit} className="bg-slate-950/80 border border-amber-500/40 rounded-xl p-5 space-y-4 max-w-md mx-auto">
+                <form
+                  onSubmit={handlePasswordSubmit}
+                  className="bg-slate-950/80 border border-amber-500/40 rounded-xl p-5 space-y-4 max-w-md mx-auto"
+                >
                   <div className="text-center">
                     <Lock className="w-8 h-8 text-amber-400 mx-auto mb-2" />
                     <h3 className="text-base font-bold text-amber-300">
@@ -278,26 +264,20 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
 
                   <div>
                     <label className="block text-xs font-semibold text-slate-300 mb-1">
-                      Introdu Parola Camerei:
+                      Introdu Parola stabilită de gazdă:
                     </label>
                     <input
                       type="password"
                       value={joinPassword}
                       onChange={(e) => setJoinPassword(e.target.value)}
-                      placeholder="Parola stabilită de gazdă"
+                      placeholder="Parola camerei"
                       autoFocus
                       required
                       className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm focus:outline-hidden focus:border-amber-400"
                     />
                   </div>
 
-                  {joinError && (
-                    <div className="text-xs text-red-400 bg-red-950/40 p-2 rounded border border-red-500/30 text-center">
-                      {joinError}
-                    </div>
-                  )}
-
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 pt-1">
                     <button
                       type="button"
                       onClick={() => setJoinRoomId('')}
@@ -317,66 +297,83 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                 /* Rooms List */
                 <div className="space-y-3">
                   <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span>Camere disponibile pe această rețea:</span>
-                    <span>{Object.keys(rooms).length} camere</span>
+                    <div className="flex items-center gap-1.5">
+                      <span>Mese de joc disponibile pe server:</span>
+                      <strong className="text-amber-300">{roomsList.length}</strong>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleManualRefresh}
+                      className="inline-flex items-center gap-1 text-[11px] text-slate-300 hover:text-amber-300 p-1 rounded hover:bg-slate-800 transition-colors cursor-pointer"
+                      title="Reîmprospătează lista"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+                      <span>Actualizează</span>
+                    </button>
                   </div>
 
-                  {Object.keys(rooms).length === 0 ? (
+                  {roomsList.length === 0 ? (
                     <div className="text-center py-10 bg-slate-950/40 border border-emerald-900/40 rounded-xl space-y-3">
                       <Users className="w-10 h-10 text-slate-600 mx-auto" />
                       <div className="text-sm font-semibold text-slate-300">
-                        Nu este nicio cameră activă momentan.
+                        Nicio masă online activă în acest moment.
                       </div>
                       <p className="text-xs text-slate-400 max-w-sm mx-auto">
-                        Fii tu primul! Creează o cameră nouă, setează o parolă și invită-ți prietenii sau adaugă boți AI.
+                        Creează tu prima masă, stabilește numărul de jucători (3-6) și trimite codul prietenilor tăi de pe telefon sau PC!
                       </p>
                       <button
                         type="button"
                         onClick={() => setActiveTab('create')}
                         className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold rounded-xl cursor-pointer shadow-md inline-flex items-center gap-1.5"
                       >
-                        <Plus className="w-4 h-4" /> Creează o Cameră Acum
+                        <Plus className="w-4 h-4" /> Creează o Masă Acum
                       </button>
                     </div>
                   ) : (
                     <div className="grid grid-cols-1 gap-2.5">
-                      {Object.values(rooms).map((r) => (
+                      {roomsList.map((r) => (
                         <div
-                          key={r.roomId}
-                          className="bg-slate-950/60 border border-emerald-900/60 hover:border-amber-500/50 rounded-xl p-3.5 flex items-center justify-between transition-all"
+                          key={r.id}
+                          className="bg-slate-950/60 border border-emerald-900/60 hover:border-amber-500/50 rounded-xl p-3 sm:p-3.5 flex items-center justify-between gap-3 transition-all"
                         >
-                          <div className="space-y-1">
+                          <div className="space-y-1 min-w-0">
                             <div className="flex items-center gap-2">
-                              <span className="font-bold text-sm text-slate-100">{r.roomName}</span>
+                              <span className="font-bold text-sm text-slate-100 truncate">
+                                {r.name}
+                              </span>
                               {r.hasPassword && (
-                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-950/60 text-amber-300 border border-amber-500/40">
-                                  <Lock className="w-2.5 h-2.5" /> Cu Parolă
+                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-amber-950/60 text-amber-300 border border-amber-500/40 shrink-0">
+                                  <Lock className="w-2.5 h-2.5" /> Parolă
                                 </span>
                               )}
                             </div>
-                            <div className="flex items-center gap-3 text-xs text-slate-400 font-mono">
-                              <span>Cod: <strong>{r.roomId}</strong></span>
+                            <div className="flex items-center gap-2 text-xs text-slate-400 font-mono">
+                              <span>
+                                Cod: <strong className="text-white">{r.id}</strong>
+                              </span>
                               <span>•</span>
-                              <span>Format: {r.gameMode === 'standard' ? '1-8-1 (32 cărți)' : 'Complet (52 cărți)'}</span>
+                              <span>
+                                Max: <strong>{r.maxPlayers || 4} jucători</strong>
+                              </span>
                             </div>
                           </div>
 
-                          <div className="flex items-center gap-3">
+                          <div className="flex items-center gap-3 shrink-0">
                             <div className="text-right">
                               <div className="text-xs font-bold text-emerald-400">
-                                {r.players.length}/4 Jucători
+                                {r.playerCount}/{r.maxPlayers || 4} Jucători
                               </div>
                               <div className="text-[10px] text-slate-400">
-                                {r.status === 'playing' ? 'În desfășurare' : 'În Așteptare'}
+                                {r.status === 'playing' ? 'În desfășurare' : 'Lobby'}
                               </div>
                             </div>
 
                             <button
                               type="button"
-                              onClick={() => handleJoinRoom(r)}
-                              disabled={r.players.length >= 4}
-                              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-colors ${
-                                r.players.length >= 4
+                              onClick={() => handleJoinRoomClick(r)}
+                              disabled={r.playerCount >= (r.maxPlayers || 4) || r.status === 'playing'}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-colors ${
+                                r.playerCount >= (r.maxPlayers || 4) || r.status === 'playing'
                                   ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
                                   : 'bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-md'
                               }`}
@@ -411,39 +408,45 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
               </div>
 
               <div>
+                <label className="block text-xs font-semibold text-slate-300 mb-1">
+                  Număr de Jucători la Masă:
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  {[3, 4, 5, 6].map((num) => (
+                    <button
+                      key={num}
+                      type="button"
+                      onClick={() => setCreateMaxPlayers(num)}
+                      className={`py-2 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                        createMaxPlayers === num
+                          ? 'bg-amber-500 text-slate-950 border-amber-400 shadow-md'
+                          : 'bg-slate-900 text-slate-300 border-slate-700 hover:border-slate-500'
+                      }`}
+                    >
+                      {num} Jucători
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Regulamentul oficial de Whist Românesc adaptează pachetul la numărul de jucători (8 cărți/jucător).
+                </p>
+              </div>
+
+              <div>
                 <label className="block text-xs font-semibold text-slate-300 mb-1 flex items-center justify-between">
-                  <span>Parola Camerei (opțională sau obligatorie):</span>
-                  <span className="text-[10px] text-amber-300 font-mono">Pentru acces securizat</span>
+                  <span>Parola Camerei (opțională):</span>
+                  <span className="text-[10px] text-amber-300 font-mono">Pentru joc privat cu prietenii</span>
                 </label>
                 <div className="relative">
                   <input
                     type="text"
                     value={createPassword}
                     onChange={(e) => setCreatePassword(e.target.value)}
-                    placeholder="ex: whist2026"
+                    placeholder="Lăsați liber pentru cameră publică"
                     className="w-full pl-9 pr-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm focus:outline-hidden focus:border-amber-400"
                   />
                   <KeyRound className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
                 </div>
-                <p className="text-[11px] text-slate-400 mt-1">
-                  Dacă setezi o parolă, doar jucătorii care o cunosc vor putea intra la această masă.
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-300 mb-1">
-                  Formatul Jocului de Whist:
-                </label>
-                <select
-                  value={createMode}
-                  onChange={(e) => setCreateMode(e.target.value as GameModeType)}
-                  className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm focus:outline-hidden focus:border-amber-400 cursor-pointer"
-                >
-                  <option value="standard">Standard Românesc (1-8-1, 24 runde, 32 cărți 7..A)</option>
-                  <option value="full52">Complet 52 cărți (1-13-1, 34 runde, pachet complet 2..A)</option>
-                  <option value="quick">Joc Rapid (1-4-1, 16 runde)</option>
-                  <option value="single13">Rundă Unică de 13 cărți (o singură mână completă)</option>
-                </select>
               </div>
 
               <div className="pt-2 flex justify-end gap-2">
@@ -458,7 +461,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                   type="submit"
                   className="px-5 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold rounded-xl text-xs cursor-pointer shadow-lg shadow-amber-950/50"
                 >
-                  Deschide Camera
+                  Deschide Camera Online
                 </button>
               </div>
             </form>
@@ -472,10 +475,12 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                 <div>
                   <h3 className="font-bold text-base text-amber-300">{currentRoom.roomName}</h3>
                   <div className="flex items-center gap-2 text-xs text-slate-400 font-mono mt-0.5">
-                    <span>Cod: <strong className="text-white">{currentRoom.roomId}</strong></span>
+                    <span>
+                      Cod Cameră: <strong className="text-white">{currentRoom.roomId}</strong>
+                    </span>
                     {currentRoom.hasPassword && (
                       <span className="text-amber-400 flex items-center gap-1">
-                        <Lock className="w-3 h-3" /> Parolă: {currentRoom.password || 'activă'}
+                        <Lock className="w-3 h-3" /> Protejată cu parolă
                       </span>
                     )}
                   </div>
@@ -487,29 +492,38 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                   className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded-lg flex items-center gap-1.5 cursor-pointer"
                 >
                   {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedCode ? 'Copiat!' : 'Copiază Cod'}</span>
+                  <span>{copiedCode ? 'Cod Copiat!' : 'Copiază Cod'}</span>
                 </button>
               </div>
 
-              {/* 4 Player Slots */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {[0, 1, 2, 3].map((slotIdx) => {
+              {/* Player Slots */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {Array.from({ length: maxSlots }).map((_, slotIdx) => {
                   const player = currentRoom.players[slotIdx];
+                  const isMe = slotIdx === mySeat;
+
                   return (
                     <div
                       key={slotIdx}
-                      className={`p-3.5 rounded-xl border flex items-center justify-between ${
+                      className={`p-3 rounded-xl border flex items-center justify-between ${
                         player
-                          ? 'bg-slate-900/80 border-emerald-800/80'
+                          ? isMe
+                            ? 'bg-amber-950/40 border-amber-500/60 ring-1 ring-amber-400/40'
+                            : 'bg-slate-900/80 border-emerald-800/80'
                           : 'bg-slate-950/40 border-dashed border-slate-800'
                       }`}
                     >
                       {player ? (
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-2.5">
                           <span className="text-2xl">{player.avatar}</span>
                           <div>
-                            <div className="font-bold text-sm text-slate-100 flex items-center gap-1.5">
+                            <div className="font-bold text-xs sm:text-sm text-slate-100 flex items-center gap-1.5">
                               <span>{player.name}</span>
+                              {isMe && (
+                                <span className="text-[10px] bg-amber-400 text-slate-950 font-black px-1.5 py-0.2 rounded">
+                                  Tu
+                                </span>
+                              )}
                               {player.id === currentRoom.hostId && (
                                 <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 px-1.5 py-0.2 rounded font-sans">
                                   Gazdă
@@ -522,7 +536,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                               )}
                             </div>
                             <div className="text-[11px] text-slate-400">
-                              Locul {slotIdx + 1} ({slotIdx === 0 ? 'Sud' : slotIdx === 1 ? 'Vest' : slotIdx === 2 ? 'Nord' : 'Est'})
+                              Locul {slotIdx + 1}
                             </div>
                           </div>
                         </div>
@@ -563,16 +577,13 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
               <div className="pt-2 flex flex-wrap items-center justify-between gap-2 border-t border-emerald-900/60">
                 <button
                   type="button"
-                  onClick={() => {
-                    setActiveTab('browse');
-                    setCurrentRoom(null);
-                  }}
+                  onClick={handleLeaveRoom}
                   className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-xl cursor-pointer"
                 >
                   Părăsește Camera
                 </button>
 
-                <div className="flex gap-2">
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
                     onClick={handleToggleReady}
@@ -586,15 +597,14 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                     <button
                       type="button"
                       onClick={handleLaunchGame}
-                      disabled={currentRoom.players.length < 4}
-                      className={`px-5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-all ${
-                        currentRoom.players.length === 4
-                          ? 'bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 shadow-lg shadow-amber-950/50'
-                          : 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                      }`}
+                      className="px-5 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer shadow-lg shadow-amber-950/50"
                     >
                       <Play className="w-4 h-4" />
-                      <span>{currentRoom.players.length < 4 ? `Așteaptă 4 jucători (${currentRoom.players.length}/4)` : 'Pornește Jocul!'}</span>
+                      <span>
+                        {currentRoom.players.length < 3
+                          ? `Pornește cu AI (${currentRoom.players.length}/${maxSlots})`
+                          : 'Pornește Partida!'}
+                      </span>
                     </button>
                   )}
                 </div>

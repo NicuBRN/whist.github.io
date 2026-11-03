@@ -17,12 +17,15 @@ import {
   RotateCcw,
   Download,
   Shield,
+  Globe,
 } from 'lucide-react';
 
 interface GameHeaderMenuProps {
   unlockedJokersCount: number;
   totalJokersCount: number;
   soundEnabled: boolean;
+  isOnlineRoom?: boolean;
+  onOpenMultiplayer?: () => void;
   onToggleSound: () => void;
   onOpenScore: () => void;
   onOpenJokers: () => void;
@@ -37,6 +40,8 @@ export const GameHeaderMenu: React.FC<GameHeaderMenuProps> = ({
   unlockedJokersCount,
   totalJokersCount,
   soundEnabled,
+  isOnlineRoom = false,
+  onOpenMultiplayer,
   onToggleSound,
   onOpenScore,
   onOpenJokers,
@@ -113,6 +118,27 @@ export const GameHeaderMenu: React.FC<GameHeaderMenuProps> = ({
                   {unlockedJokersCount}/{totalJokersCount}
                 </span>
               </button>
+
+              {/* Online Multiplayer Lobby */}
+              {onOpenMultiplayer && (
+                <button
+                  type="button"
+                  onClick={() => handleAction(onOpenMultiplayer)}
+                  className={`w-full px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold flex items-center justify-between cursor-pointer transition-colors ${
+                    isOnlineRoom
+                      ? 'bg-emerald-950/50 hover:bg-emerald-900/60 border border-emerald-500/40 text-emerald-200'
+                      : 'hover:bg-slate-900 text-slate-200'
+                  }`}
+                >
+                  <div className="flex items-center gap-2.5">
+                    <Globe className="w-4 h-4 text-emerald-400" />
+                    <span>{isOnlineRoom ? 'Masa Online Activă' : 'Camere Multiplayer'}</span>
+                  </div>
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                    Online
+                  </span>
+                </button>
+              )}
 
               {/* Score Table */}
               <button
