@@ -52,6 +52,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
   // Form states for joining
   const [joinRoomId, setJoinRoomId] = useState('');
   const [joinPassword, setJoinPassword] = useState('');
+  const [manualRoomCode, setManualRoomCode] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [copiedCode, setCopiedCode] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -172,6 +173,32 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
       }
     } catch {
       setErrorMessage('Nu s-a putut conecta la cameră!');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // Direct room code join handler
+  const handleDirectCodeJoin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const clean = manualRoomCode.trim().toUpperCase();
+    if (!clean) {
+      setErrorMessage('Introduceți codul mesei (ex: WHIST-1234 sau 1234).');
+      return;
+    }
+    const code = clean.startsWith('WHIST-') ? clean : `WHIST-${clean}`;
+    setErrorMessage('');
+    setIsSubmitting(true);
+    try {
+      const info = await multiplayerService.fetchRoomInfo(code);
+      if (info && info.hasPassword) {
+        setJoinRoomId(info.id);
+        setJoinPassword('');
+        return;
+      }
+      await executeJoin(code, '');
+    } catch {
+      setErrorMessage(`Masa cu codul '${code}' nu a putut fi găsită.`);
     } finally {
       setIsSubmitting(false);
     }
@@ -345,8 +372,39 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                 </form>
               ) : (
                 /* Rooms List */
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between text-xs text-slate-400">
+                <div className="space-y-4">
+                  {/* Direct Room Code Input Box */}
+                  <div className="bg-slate-950/80 border border-amber-500/40 rounded-xl p-3 sm:p-4 shadow-lg">
+                    <div className="text-xs font-bold text-amber-300 flex items-center gap-1.5 mb-2">
+                      <KeyRound className="w-4 h-4 text-amber-400" />
+                      <span>Ai primit un cod de masă? Intră direct aici:</span>
+                    </div>
+                    <form onSubmit={handleDirectCodeJoin} className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="text"
+                        value={manualRoomCode}
+                        onChange={(e) => setManualRoomCode(e.target.value.toUpperCase())}
+                        placeholder="Ex: WHIST-8232 sau 8232"
+                        className="flex-1 px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white font-mono text-sm tracking-wider uppercase focus:outline-hidden focus:border-amber-400 placeholder:normal-case placeholder:tracking-normal placeholder:text-slate-500"
+                      />
+                      <button
+                        type="submit"
+                        disabled={isSubmitting || !manualRoomCode.trim()}
+                        className="px-5 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 disabled:opacity-50 text-slate-950 font-bold rounded-lg text-xs cursor-pointer shadow-md flex items-center justify-center gap-1.5 shrink-0"
+                      >
+                        {isSubmitting ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>Se verifică...</span>
+                          </>
+                        ) : (
+                          <span>Intră în Masă</span>
+                        )}
+                      </button>
+                    </form>
+                  </div>
+
+                  <div className="flex items-center justify-between text-xs text-slate-400 pt-1">
                     <div className="flex items-center gap-1.5">
                       <span>Mese de joc disponibile pe server:</span>
                       <strong className="text-amber-300">{roomsList.length}</strong>
@@ -551,29 +609,37 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
             ) : (
               <div className="space-y-4">
                 {/* Room details banner */}
-                <div className="bg-slate-950/70 border border-amber-500/30 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
+                <div className="bg-gradient-to-r from-slate-950 via-emerald-950/70 to-slate-950 border border-amber-500/50 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-lg">
                   <div>
-                    <h3 className="font-bold text-base text-amber-300">{currentRoom.roomName}</h3>
-                    <div className="flex items-center gap-2 text-xs text-slate-400 font-mono mt-0.5">
-                      <span>
-                        Cod Cameră: <strong className="text-white">{currentRoom.roomId}</strong>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400">
+                        Masa Online Activă
                       </span>
                       {currentRoom.hasPassword && (
-                        <span className="text-amber-400 flex items-center gap-1">
-                          <Lock className="w-3 h-3" /> Protejată cu parolă
+                        <span className="text-[10px] text-amber-400 bg-amber-950/60 border border-amber-500/40 px-1.5 py-0.5 rounded flex items-center gap-1">
+                          <Lock className="w-2.5 h-2.5" /> Protejată cu parolă
                         </span>
                       )}
                     </div>
+                    <h3 className="font-bold text-lg text-amber-300 font-cinzel">{currentRoom.roomName}</h3>
+                    <div className="flex items-center gap-2 text-xs text-slate-300 font-mono mt-1">
+                      <span>Trimite codul prietenilor:</span>
+                      <span className="bg-amber-400/20 text-amber-300 border border-amber-400/50 px-2 py-0.5 rounded-md font-bold tracking-widest text-sm">
+                        {currentRoom.roomId}
+                      </span>
+                    </div>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={handleCopyCode}
-                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded-lg flex items-center gap-1.5 cursor-pointer"
-                  >
-                    {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                    <span>{copiedCode ? 'Cod Copiat!' : 'Copiază Cod'}</span>
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleCopyCode}
+                      className="px-3.5 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 text-xs font-bold rounded-lg flex items-center gap-1.5 cursor-pointer shadow-md transition-all"
+                    >
+                      {copiedCode ? <Check className="w-4 h-4 text-slate-950" /> : <Copy className="w-4 h-4 text-slate-950" />}
+                      <span>{copiedCode ? 'Cod Copiat!' : 'Copiază Codul'}</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Player Slots */}

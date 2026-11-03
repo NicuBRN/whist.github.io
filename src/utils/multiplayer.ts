@@ -95,6 +95,12 @@ export interface RoomStatePayload {
   forbiddenBid: number;
 }
 
+export function normalizeRoomCode(code: string): string {
+  const clean = code.trim().toUpperCase();
+  if (!clean) return '';
+  return clean.startsWith('WHIST-') ? clean : `WHIST-${clean}`;
+}
+
 type ServerMessage =
   | { type: 'ROOMS_LIST'; rooms: RoomListing[] }
   | ({ type: 'ROOM_STATE' } & RoomStatePayload)
@@ -470,12 +476,50 @@ class RealtimeMultiplayerService {
     return payload;
   }
 
+  // Fetch Room Info by code
+  public async fetchRoomInfo(rawRoomId: string): Promise<RoomListing | null> {
+    const roomId = normalizeRoomCode(rawRoomId);
+    if (!roomId) return null;
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2500);
+      const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.room) {
+          const listing: RoomListing = {
+            id: data.room.roomId,
+            name: data.room.roomName,
+            hasPassword: data.room.hasPassword,
+            hostId: data.room.hostId,
+            playerCount: data.room.playerCount || 1,
+            maxPlayers: data.room.maxPlayers || 4,
+            status: data.room.status || 'lobby',
+            updatedAt: Date.now(),
+          };
+          this.updateRoomListingLocal(data.room);
+          return listing;
+        }
+      }
+    } catch {
+      // Ignored
+    }
+    return this.cachedRooms.find((r) => r.id === roomId) || null;
+  }
+
   // Join Room
   public async joinRoom(
-    roomId: string,
+    rawRoomId: string,
     player: { id: string; name: string; avatar?: string },
     password?: string
   ): Promise<{ success: boolean; payload?: RoomStatePayload; error?: string }> {
+    const roomId = normalizeRoomCode(rawRoomId);
+    if (!roomId) {
+      return { success: false, error: 'Cod de cameră invalid!' };
+    }
     this.activePlayerId = player.id;
 
     // Send over WS
@@ -489,8 +533,8 @@ class RealtimeMultiplayerService {
     // Call REST endpoint
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000);
-      const res = await fetch(`/api/rooms/${roomId}/join`, {
+      const timeoutId = setTimeout(() => controller.abort(), 3500);
+      const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

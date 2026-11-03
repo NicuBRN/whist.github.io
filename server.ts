@@ -6,6 +6,7 @@
 import express, { Request, Response } from 'express';
 import http from 'http';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
@@ -108,8 +109,57 @@ export interface ServerRoomState {
   updatedAt: number;
 }
 
-// In-memory room storage
+// Persistent room storage backed by /tmp/whist_online_rooms.json
 const rooms = new Map<string, ServerRoomState>();
+const ROOMS_FILE = path.join('/tmp', 'whist_online_rooms.json');
+
+function saveRoomsToDisk() {
+  try {
+    const list = Array.from(rooms.entries());
+    fs.writeFileSync(ROOMS_FILE, JSON.stringify(list), 'utf-8');
+  } catch (err) {
+    console.warn('Could not save rooms to disk:', err);
+  }
+}
+
+function loadRoomsFromDisk() {
+  try {
+    if (fs.existsSync(ROOMS_FILE)) {
+      const data = fs.readFileSync(ROOMS_FILE, 'utf-8');
+      const list: Array<[string, ServerRoomState]> = JSON.parse(data);
+      const now = Date.now();
+      let count = 0;
+      list.forEach(([id, room]) => {
+        // Retain rooms created or updated within the last 6 hours
+        if (now - (room.updatedAt || room.createdAt || 0) < 6 * 3600 * 1000) {
+          rooms.set(id, room);
+          count++;
+        }
+      });
+      console.log(`Whist server: restored ${count} persistent rooms from storage.`);
+    }
+  } catch (err) {
+    console.warn('Could not load rooms from disk:', err);
+  }
+}
+
+// Load existing rooms on process startup
+loadRoomsFromDisk();
+
+export function getRoomById(rawId: string): ServerRoomState | undefined {
+  if (!rawId) return undefined;
+  const clean = rawId.trim().toUpperCase();
+  const withPrefix = clean.startsWith('WHIST-') ? clean : `WHIST-${clean}`;
+  if (rooms.has(clean)) return rooms.get(clean);
+  if (rooms.has(withPrefix)) return rooms.get(withPrefix);
+  for (const [id, room] of rooms.entries()) {
+    if (id.toUpperCase() === clean || id.toUpperCase() === withPrefix) {
+      return room;
+    }
+  }
+  return undefined;
+}
+
 // Map socket to connection metadata
 const socketRooms = new Map<WebSocket, { roomId: string; playerId: string; seatIndex: number }>();
 
@@ -531,9 +581,9 @@ function joinRoomLogic(
   player: { id: string; name: string; avatar?: string },
   password?: string
 ): { success: true; payload: ReturnType<typeof buildClientRoomPayload> } | { success: false; error: string } {
-  const room = rooms.get(roomId);
+  const room = getRoomById(roomId);
   if (!room) {
-    return { success: false, error: 'Camera nu există!' };
+    return { success: false, error: `Camera '${roomId}' nu există sau a expirat!` };
   }
   if (room.hasPassword && room.password !== password) {
     return { success: false, error: 'Parolă incorectă!' };
@@ -565,7 +615,8 @@ function joinRoomLogic(
 
   room.players.push(newPlayer);
   room.updatedAt = Date.now();
-  broadcastRoom(roomId);
+  saveRoomsToDisk();
+  broadcastRoom(room.roomId);
   broadcastRoomsList();
 
   const payload = buildClientRoomPayload(room, seatIndex);
@@ -573,8 +624,8 @@ function joinRoomLogic(
 }
 
 function handleRoomActionLogic(roomId: string, data: any): { success: boolean; error?: string } {
-  const room = rooms.get(roomId);
-  if (!room) return { success: false, error: 'Camera nu există!' };
+  const room = getRoomById(roomId);
+  if (!room) return { success: false, error: `Camera '${roomId}' nu există!` };
 
   const { type, playerId, seatIndex, bid, card } = data;
 
@@ -719,37 +770,7 @@ wss.on('connection', (ws: WebSocket) => {
   });
 
   ws.on('close', () => {
-    const meta = socketRooms.get(ws);
-    if (meta) {
-      socketRooms.delete(ws);
-      setTimeout(() => {
-        const room = rooms.get(meta.roomId);
-        if (room && room.status === 'lobby') {
-          let isStillConnected = false;
-          socketRooms.forEach((v) => {
-            if (v.roomId === meta.roomId && v.playerId === meta.playerId) {
-              isStillConnected = true;
-            }
-          });
-
-          if (!isStillConnected) {
-            room.players = room.players.filter((p) => p.id !== meta.playerId);
-            if (room.players.length === 0) {
-              rooms.delete(meta.roomId);
-            } else {
-              room.players.forEach((p, idx) => {
-                p.seatIndex = idx;
-              });
-              if (room.hostId === meta.playerId && room.players[0]) {
-                room.hostId = room.players[0].id;
-              }
-              broadcastRoom(meta.roomId);
-            }
-            broadcastRoomsList();
-          }
-        }
-      }, 5000);
-    }
+    socketRooms.delete(ws);
   });
 });
 
@@ -777,6 +798,7 @@ app.post('/api/rooms/create', (req: Request, res: Response) => {
     return;
   }
   const result = createRoomLogic(roomName, password, maxPlayers, hostPlayer);
+  saveRoomsToDisk();
   res.json({ success: true, ...result });
 });
 
@@ -791,11 +813,12 @@ app.post('/api/rooms/:id/join', (req: Request, res: Response) => {
     res.status(400).json({ error: result.error });
     return;
   }
+  saveRoomsToDisk();
   res.json({ success: true, ...result.payload });
 });
 
 app.get('/api/rooms/:id/state', (req: Request, res: Response) => {
-  const room = rooms.get(req.params.id);
+  const room = getRoomById(req.params.id);
   if (!room) {
     res.status(404).json({ error: 'Camera nu a fost găsită' });
     return;
@@ -812,8 +835,9 @@ app.post('/api/rooms/:id/action', (req: Request, res: Response) => {
     res.status(400).json({ error: result.error });
     return;
   }
+  saveRoomsToDisk();
   const playerId = req.body.playerId || '';
-  const room = rooms.get(req.params.id);
+  const room = getRoomById(req.params.id);
   if (room) {
     const seatIndex = room.players.findIndex((p) => p.id === playerId);
     const payload = buildClientRoomPayload(room, seatIndex >= 0 ? seatIndex : 0);
@@ -824,7 +848,7 @@ app.post('/api/rooms/:id/action', (req: Request, res: Response) => {
 });
 
 app.get('/api/rooms/:id', (req: Request, res: Response) => {
-  const room = rooms.get(req.params.id);
+  const room = getRoomById(req.params.id);
   if (!room) {
     res.status(404).json({ error: 'Camera nu a fost găsită' });
     return;
