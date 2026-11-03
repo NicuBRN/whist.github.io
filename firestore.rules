@@ -1,0 +1,13 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /rooms/{roomId} {
+      // Allow players anywhere to read and write active room state
+      allow read, write: if true;
+
+      match /hands/{seatIndex} {
+        allow read, write: if true;
+      }
+    }
+  }
+}

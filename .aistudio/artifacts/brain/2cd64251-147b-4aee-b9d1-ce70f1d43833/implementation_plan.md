@@ -1,54 +1,65 @@
-# Plan de Implementare: Cronometru 5 Secunde Licitație & Layout Aerisit și Predictiv
+# Plan de Implementare: Multiplayer în Timp Real prin Firebase Firestore (Optimizat pentru Vercel)
 
-Acest plan rezolvă încărcarea vizuală a interfeței, optimizează experiența pentru telefon, tabletă și desktop, și introduce numărătoarea inversă de 5 secunde înainte de licitație cu opțiune de acțiune imediată sau pauză.
-
----
-
-## 1. Cronometru de 5 Secunde la Licitație
-- **Numărătoare Inversă Activă în Faza `'inspecting'`**:
-  - După împărțirea cărților, se inițiază un cronometru de 5 secunde (`5 → 4 → 3 → 2 → 1 → 0`).
-  - Butonul principal afișează dinamic: **„Sunt gata de licitație (X s)”** împreună cu un inel sau o bară de progres auriu-smarald.
-  - Utilizatorul poate apăsa butonul oricând pentru a începe instantaneu licitația fără să aștepte.
-  - **Opțiune de Pauză**: Un buton discret de pauză (⏸) permițând utilizatorului să oprească timpul dacă dorește o analiză mai îndelungată a cărților.
-  - La atingerea valorii 0, jocul pornește automat faza de licitație (`handleStartBidding`).
-  - Gestiune corectă a timerului în `useEffect` cu curățare la unmount sau la schimbarea fazei.
+Acest plan rezolvă eroarea de conexiune la server întâmpinată pe Vercel prin migrarea de la un server local Node.js/WebSocket (incompatibil cu arhitectura serverless Vercel) la **Firebase Firestore în timp real**.
 
 ---
 
-## 2. Simplificare și Aerisire Layout (Desktop, Tabletă, Mobil)
-- **Bara Superioară (HUD) Ordonată și Neîncărcată**:
-  - În loc de 7 butoane aglomerate pe ecranul mobil, grupăm interfața în:
-    - **Informații esențiale (stânga)**: Runda curentă și insigna de Atu clară.
-    - **Acțiuni primare (dreapta)**: Butonul rapid **„Scor”** (Trophy) și butonul **„Meniu”** (Dropdown / Drawer cu 3 linii / ⚙️).
-  - **Meniu Derulant Secundar Compact**:
-    - Centralizează accesul rapid la: *Colecția de Jokeri & Teme*, *Statistici & Realizări*, *Tutorial Interactiv*, *Regulament Oficial*, *Activare/Dezactivare Sunet* și *Joc Nou*.
-    - Eliberează complet spațiul vertical și orizontal pe telefoane și tablete.
-- **Poziționare Predictivă a Adversarilor AI**:
-  - Distribuție echilibrată a adversarilor în partea superioară a mesei într-o formă aerisită, cu carduri unificate (avatar, nume, licitație și cupe câștigate).
-  - Dimensiuni compactate pentru a nu sufoca spațiul central de joc.
-- **Suprafața Centrală pentru Cupe**:
-  - Centru oval/rotund stabil, redimensionat proporțional pe mobil (`max-w-[260px]` pe ecran îngust) pentru a nu intersecta mâna jucătorului.
-  - Cărțile jucate în cupă sunt poziționate predictiv în funcție de direcția jucătorului care le-a pus.
+## 1. De ce apare „eroare de conexiune la server” pe Vercel?
+- **Arhitectura Vercel**: Vercel găzduiește aplicațiile Vite/React ca fișiere statice sau funcții Serverless efemere.
+- **Limitare**: Un proces continuu de tip `node server.ts` cu conexiuni persistente `WebSocket` (`/ws`) și stocare în memorie sau fișiere locale (`/tmp`) **nu poate rula pe Vercel**.
+- **Soluția**: Folosirea **Firebase Firestore** direct din browser cu listeneri în timp real (`onSnapshot`). Nu mai este nevoie de niciun server extern; jocul rulează direct pe Vercel pe orice telefon, tabletă sau PC de pe internet.
 
 ---
 
-## 3. Dispunere Ergonomică a Cărților din Mână pe Telefon
-- **Rând Orizontal cu Derulare Fină**:
-  - Cărțile jucătorului stau într-un rând orizontal cu `overflow-x-auto` și `hide-scrollbar`, centrate automat dacă încap toate pe ecran (runde mici) și scrollabile fluid prin atingere dacă runda are multe cărți (runde de 8).
-  - Spațiere optimă (fără suprapunere excesivă care să ascundă simbolul culorii sau numărul cărții).
-  - Feedback tactil imediat la atingere: ridicare vizuală (`-translate-y-3`) și strălucire aurie pentru cărțile legale de jucat.
-- **Bara de Status a Jucătorului**:
-  - Amplasată discret deasupra cărților: scor total, licitație curentă, cupe câștigate și indicator dacă utilizatorul este Dealer.
+## 2. Arhitectura de Date în Firestore
+
+### Colecția `rooms/{roomId}`
+Fiecare masă de joc este un document în Firestore:
+- `roomId`: Codul unic (ex: `WHIST-7879`).
+- `roomName`: Numele mesei (ex: `Masa Prietenilor`).
+- `hasPassword`: Boolean (opțional dacă e protejată cu parolă).
+- `password`: Parola hash/text (opțională).
+- `hostId`: ID-ul utilizatorului care a creat masa.
+- `maxPlayers`: Numărul de locuri (3–6 jucători).
+- `status`: `'lobby' | 'playing' | 'round_recap' | 'game_over'`.
+- `players`: Listă cu jucătorii de la masă (`id`, `name`, `avatar`, `isAi`, `seatIndex`, `isReady`, `score`, `bid`, `tricksWon`).
+- `phase`: Faza curentă (`'dealing' | 'inspecting' | 'bidding' | 'playing' | 'trick_eval' | 'round_recap'`).
+- `currentTurn`: Indexul locului jucătorului la rând.
+- `currentRoundIdx`: Indexul rundei curente.
+- `trumpCard` & `trumpSuit`: Cartea și culoarea de atu.
+- `currentTrick`: Cărțile jucate în cupa curentă.
+- `winningCardId` & `trickWinnerBanner`: Datele evaluării cupei.
+- `history`: Istoricul punctajelor pentru foaia de scor.
+- `updatedAt`: Timestamp pentru sortare și curățare automată a camerelor vechi.
+
+### Securitatea Cărților din Mână (Private Hands)
+- Cărțile din mâna fiecărui jucător sunt stocate fie criptate/private în subcolecția `rooms/{roomId}/hands/{seatIndex}` sau structurate astfel încât ceilalți jucători să nu poată vedea cărțile oponenților în consolă.
 
 ---
 
-## 4. Etape de Implementare și Verificare
-1. **Adăugare State Cronometru & Curățare**:
-   - `countdown`, `isPaused`, `useEffect` cu `setInterval` în `src/App.tsx`.
-2. **Creare Componentă `HeaderMenuDropdown.tsx` sau Meniu Compact Integrat**:
-   - Meniu derulant mobil/desktop pentru acțiunile secundare.
-3. **Refactorizare Layout Masă & Mână în `src/App.tsx` & `src/index.css`**:
-   - Ajustare proporții responsive, eliminare elemente redundante, spațiere curată.
-4. **Verificare și Validare**:
-   - Rulare `npx tsx --test src/game/rules.test.ts` (asigurare că regulile rămân intacte).
-   - Rulare `lint_applet` și `compile_applet`.
+## 3. Sincronizare în Timp Real (`multiplayerService`)
+- Înlocuirea `fetch('/api/rooms/...')` și `new WebSocket(...)` cu:
+  - `onSnapshot(doc(db, 'rooms', roomId), ...)`: Notifică instantaneu interfața React la fiecare mutare (licitație, carte jucată, jucător adăugat, start joc).
+  - `onSnapshot(query(collection(db, 'rooms'), where('status', '==', 'lobby'), limit(25)), ...)`: Actualizează automat lista de mese disponibile în tab-ul „Camere Active”.
+- **Automatizare AI de către Gazdă (Host)**: Când este rândul unui robot AI (`player.isAi === true`), clientul gazdă evaluează cartea/licitația conform regulamentului oficial Whist și actualizează documentul Firestore, sincronizând toți jucătorii simultan.
+
+---
+
+## 4. Etape de Execuție
+
+1. **Inițiere Firebase Setup**:
+   - Deschidere flux interactiv de acord Firebase în AI Studio.
+   - Verificare termeni și provizionare automată a instanței Firestore.
+2. **Generare Reguli de Securitate (`firestore.rules`)**:
+   - Permisiuni de citire/scriere pentru camerele active și desfășurarea jocului de Whist.
+   - Implementare `DeployRules` pentru activarea regulilor în cloud.
+3. **Refactorizare `src/utils/multiplayer.ts`**:
+   - Integrare Firebase SDK (`firebase/firestore`).
+   - Implementare `createRoom`, `joinRoom`, `findAndJoinRoom`, `addAi`, `toggleReady`, `startRoomGame`, `placeBid`, `playCard`, `nextRound`, `leaveRoom`.
+   - Păstrare fallback local pentru deconectări accidentale de rețea.
+4. **Actualizare UI `MultiplayerLobbyModal.tsx`**:
+   - Căutare și alăturare instantanee după cod (`WHIST-XXXX`).
+   - Afișare stare conexiune cloud și listă de mese active sincronizate în timp real.
+5. **Verificare și Build Static pentru Vercel**:
+   - Validare cu `lint_applet` și `compile_applet`.
+   - Testare creare masă, intrare cu cod de pe alt dispozitiv și joc complet de Whist.

@@ -1,0 +1,30 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Whist Room",
+      "description": "A real-time multiplayer Whist room",
+      "type": "object",
+      "properties": {
+        "roomId": { "type": "string" },
+        "roomName": { "type": "string" },
+        "hasPassword": { "type": "boolean" },
+        "password": { "type": "string" },
+        "hostId": { "type": "string" },
+        "maxPlayers": { "type": "number" },
+        "status": { "type": "string", "enum": ["lobby", "playing", "round_recap", "game_over"] },
+        "phase": { "type": "string" },
+        "currentTurn": { "type": "number" },
+        "currentRoundIdx": { "type": "number" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["roomId", "roomName", "hostId", "status"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomId}": {
+      "schema": { "$ref": "Room" },
+      "description": "Active multiplayer Whist rooms"
+    }
+  }
+}

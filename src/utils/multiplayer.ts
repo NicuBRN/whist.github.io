@@ -4,6 +4,19 @@
  */
 
 import {
+  doc,
+  collection,
+  setDoc,
+  getDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
+  query,
+  limit,
+  Unsubscribe,
+} from 'firebase/firestore';
+import { db } from '../firebase.ts';
+import {
   GameModeType,
   Card,
   Suit,
@@ -12,6 +25,10 @@ import {
   generateRounds,
   getLegalCards,
   getForbiddenBid,
+  evaluateTrickWinner,
+  calculateRoundPoints,
+  calculateAIBid,
+  selectAICard,
 } from '../game/rules.ts';
 
 export interface RoomPlayer {
@@ -101,230 +118,67 @@ export function normalizeRoomCode(code: string): string {
   return clean.startsWith('WHIST-') ? clean : `WHIST-${clean}`;
 }
 
-type ServerMessage =
-  | { type: 'ROOMS_LIST'; rooms: RoomListing[] }
-  | ({ type: 'ROOM_STATE' } & RoomStatePayload)
-  | { type: 'ERROR'; message: string };
-
 type RoomsListListener = (rooms: RoomListing[]) => void;
 type RoomStateListener = (data: RoomStatePayload) => void;
 type ErrorListener = (errorMsg: string) => void;
 
+const DEFAULT_AI_NAMES = ['Radu (AI)', 'Elena (AI)', 'Mihai (AI)', 'Andrei (AI)', 'Ioana (AI)'];
+const DEFAULT_AI_AVATARS = ['🦊', '🦉', '🐻', '🦁', '🐺'];
+
 class RealtimeMultiplayerService {
-  private ws: WebSocket | null = null;
-  private bc: BroadcastChannel | null = null;
   private roomsListListeners: RoomsListListener[] = [];
   private roomStateListeners: RoomStateListener[] = [];
   private errorListeners: ErrorListener[] = [];
   private cachedRooms: RoomListing[] = [];
   private cachedRoomState: RoomStatePayload | null = null;
-  private localHands: Record<number, Card[]> = {};
   private activeRoomId: string | null = null;
   private activePlayerId: string = 'user-1';
-  private pollingTimer: number | null = null;
-  private lobbyPollingTimer: number | null = null;
+  private roomDocUnsub: Unsubscribe | null = null;
+  private handDocUnsub: Unsubscribe | null = null;
+  private roomsListUnsub: Unsubscribe | null = null;
+  private isProcessingAi: boolean = false;
 
   constructor() {
     if (typeof window !== 'undefined') {
-      this.initBroadcastChannel();
-      this.initWebSocket();
-      this.fetchInitialRooms();
-      this.startLobbyPolling();
+      this.initRoomsListSubscription();
     }
   }
 
-  private initBroadcastChannel() {
-    if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return;
+  // Subscribe to public rooms list in Firestore
+  private initRoomsListSubscription() {
     try {
-      this.bc = new BroadcastChannel('whist_ro_multiplayer_channel');
-      this.bc.onmessage = (event) => {
-        const msg = event.data;
-        if (!msg || typeof msg !== 'object') return;
-
-        if (msg.type === 'BC_ROOM_UPDATE' && msg.room) {
-          const room = msg.room as RoomSyncState;
-          this.updateRoomListingLocal(room);
-          if (this.activeRoomId === room.roomId && this.cachedRoomState) {
-            const seat = this.cachedRoomState.mySeat;
-            const updated: RoomStatePayload = {
-              ...this.cachedRoomState,
-              room,
-            };
-            this.cachedRoomState = updated;
-            this.roomStateListeners.forEach((l) => l(updated));
-          }
-        } else if (msg.type === 'BC_ROOM_LIST_REQUEST') {
-          if (this.cachedRooms.length > 0) {
-            this.bc?.postMessage({
-              type: 'BC_ROOM_LIST_RESPONSE',
-              rooms: this.cachedRooms,
-            });
-          }
-        } else if (msg.type === 'BC_ROOM_LIST_RESPONSE' && Array.isArray(msg.rooms)) {
-          this.mergeRoomsList(msg.rooms);
+      const roomsQuery = query(collection(db, 'rooms'), limit(50));
+      this.roomsListUnsub = onSnapshot(
+        roomsQuery,
+        (snapshot) => {
+          const list: RoomListing[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data() as Partial<RoomSyncState>;
+            if (data && data.roomId) {
+              list.push({
+                id: data.roomId,
+                name: data.roomName || 'Masă Whist',
+                hasPassword: !!data.hasPassword,
+                hostId: data.hostId || '',
+                playerCount: Array.isArray(data.players) ? data.players.length : 1,
+                maxPlayers: data.maxPlayers || 4,
+                status: data.status || 'lobby',
+                updatedAt: data.updatedAt || Date.now(),
+              });
+            }
+          });
+          // Sort by latest activity
+          list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          this.cachedRooms = list;
+          this.roomsListListeners.forEach((l) => l(list));
+        },
+        (error) => {
+          console.warn('Rooms list snapshot warning:', error);
         }
-      };
-    } catch {
-      // Ignore broadcast channel errors in restricted environments
+      );
+    } catch (e) {
+      console.warn('Failed to setup Firestore rooms list subscription:', e);
     }
-  }
-
-  private initWebSocket() {
-    if (typeof window === 'undefined') return;
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-      this.ws = new WebSocket(wsUrl);
-
-      this.ws.onopen = () => {
-        this.sendWs({ type: 'GET_ROOMS' });
-      };
-
-      this.ws.onmessage = (event) => {
-        try {
-          const data: ServerMessage = JSON.parse(event.data);
-          if (data.type === 'ROOMS_LIST') {
-            this.mergeRoomsList(data.rooms);
-          } else if (data.type === 'ROOM_STATE') {
-            this.activeRoomId = data.room.roomId;
-            const payload: RoomStatePayload = {
-              room: data.room,
-              mySeat: data.mySeat,
-              myHand: data.myHand || this.cachedRoomState?.myHand || [],
-              legalCards: data.legalCards || this.cachedRoomState?.legalCards || [],
-              forbiddenBid: data.forbiddenBid ?? -1,
-            };
-            this.cachedRoomState = payload;
-            this.roomStateListeners.forEach((l) => l(payload));
-            this.updateRoomListingLocal(data.room);
-          } else if (data.type === 'ERROR') {
-            this.errorListeners.forEach((l) => l(data.message));
-          }
-        } catch {
-          // Ignore
-        }
-      };
-
-      this.ws.onclose = () => {
-        // Will rely on HTTP REST polling
-      };
-
-      this.ws.onerror = () => {
-        // Fall back gracefully to REST
-      };
-    } catch {
-      // Ignore, HTTP fallback is active
-    }
-  }
-
-  private sendWs(data: unknown) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      try {
-        this.ws.send(JSON.stringify(data));
-      } catch {
-        // Fall back to REST
-      }
-    }
-  }
-
-  private mergeRoomsList(serverRooms: RoomListing[]) {
-    const map = new Map<string, RoomListing>();
-    serverRooms.forEach((r) => map.set(r.id, r));
-    this.cachedRooms.forEach((r) => {
-      if (!map.has(r.id) && Date.now() - r.updatedAt < 1000 * 60 * 30) {
-        map.set(r.id, r);
-      }
-    });
-    this.cachedRooms = Array.from(map.values());
-    this.roomsListListeners.forEach((l) => l(this.cachedRooms));
-  }
-
-  private updateRoomListingLocal(room: RoomSyncState) {
-    const listing: RoomListing = {
-      id: room.roomId,
-      name: room.roomName,
-      hasPassword: room.hasPassword,
-      hostId: room.hostId,
-      playerCount: room.players.length,
-      maxPlayers: room.maxPlayers,
-      status: room.status,
-      updatedAt: room.updatedAt || Date.now(),
-    };
-    const idx = this.cachedRooms.findIndex((r) => r.id === listing.id);
-    if (idx >= 0) {
-      this.cachedRooms[idx] = listing;
-    } else {
-      this.cachedRooms.unshift(listing);
-    }
-    this.roomsListListeners.forEach((l) => l(this.cachedRooms));
-  }
-
-  private startLobbyPolling() {
-    if (typeof window === 'undefined') return;
-    if (this.lobbyPollingTimer) clearInterval(this.lobbyPollingTimer);
-    this.lobbyPollingTimer = window.setInterval(() => {
-      if (!this.activeRoomId) {
-        this.fetchInitialRooms();
-      }
-    }, 2500);
-  }
-
-  private startRoomPolling(roomId: string) {
-    this.activeRoomId = roomId;
-    if (this.pollingTimer) clearInterval(this.pollingTimer);
-    this.pollingTimer = window.setInterval(async () => {
-      if (!this.activeRoomId || this.activeRoomId !== roomId) {
-        if (this.pollingTimer) clearInterval(this.pollingTimer);
-        return;
-      }
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2000);
-        const res = await fetch(
-          `/api/rooms/${roomId}/state?playerId=${encodeURIComponent(this.activePlayerId)}`,
-          { signal: controller.signal }
-        );
-        clearTimeout(timeoutId);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.room) {
-            const payload: RoomStatePayload = {
-              room: data.room,
-              mySeat: data.mySeat,
-              myHand: data.myHand || this.cachedRoomState?.myHand || [],
-              legalCards: data.legalCards || this.cachedRoomState?.legalCards || [],
-              forbiddenBid: data.forbiddenBid ?? -1,
-            };
-            this.cachedRoomState = payload;
-            this.roomStateListeners.forEach((l) => l(payload));
-            this.updateRoomListingLocal(data.room);
-          }
-        }
-      } catch {
-        // Ignore network glitches
-      }
-    }, 1200);
-  }
-
-  public async fetchInitialRooms(): Promise<RoomListing[]> {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
-      const res = await fetch('/api/rooms', { signal: controller.signal });
-      clearTimeout(timeoutId);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.rooms) {
-          this.mergeRoomsList(data.rooms);
-          return this.cachedRooms;
-        }
-      }
-    } catch {
-      // Ignore
-    }
-    // Ask broadcast channel as well
-    this.bc?.postMessage({ type: 'BC_ROOM_LIST_REQUEST' });
-    return this.cachedRooms;
   }
 
   public getCachedRooms(): RoomListing[] {
@@ -360,7 +214,37 @@ class RealtimeMultiplayerService {
     };
   }
 
-  // Create Room (Guaranteed to return a valid RoomStatePayload without freezing)
+  public async fetchInitialRooms(): Promise<RoomListing[]> {
+    return this.cachedRooms;
+  }
+
+  // Fetch Room Info by code
+  public async fetchRoomInfo(rawRoomId: string): Promise<RoomListing | null> {
+    const roomId = normalizeRoomCode(rawRoomId);
+    if (!roomId) return null;
+    try {
+      const docRef = doc(db, 'rooms', roomId);
+      const snap = await getDoc(docRef);
+      if (snap.exists()) {
+        const data = snap.data() as RoomSyncState;
+        return {
+          id: data.roomId,
+          name: data.roomName,
+          hasPassword: data.hasPassword,
+          hostId: data.hostId,
+          playerCount: data.players.length,
+          maxPlayers: data.maxPlayers,
+          status: data.status,
+          updatedAt: data.updatedAt,
+        };
+      }
+    } catch {
+      // Ignored
+    }
+    return this.cachedRooms.find((r) => r.id === roomId) || null;
+  }
+
+  // Create Room in Firestore
   public async createRoom(
     roomName: string,
     password?: string,
@@ -372,62 +256,10 @@ class RealtimeMultiplayerService {
     }
   ): Promise<RoomStatePayload> {
     this.activePlayerId = hostPlayer.id;
+    const roomId = `WHIST-${Math.floor(1000 + Math.random() * 9000)}`;
 
-    // Send over WS immediately if open
-    this.sendWs({
-      type: 'CREATE_ROOM',
-      roomName,
-      password: password || undefined,
-      maxPlayers,
-      hostPlayer,
-    });
-
-    // Try server creation with a 2.5s timeout
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2500);
-
-      const res = await fetch('/api/rooms/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          roomName,
-          password: password || undefined,
-          maxPlayers,
-          hostPlayer,
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success && data.room) {
-          const payload: RoomStatePayload = {
-            room: data.room,
-            mySeat: data.mySeat ?? 0,
-            myHand: data.myHand || [],
-            legalCards: data.legalCards || [],
-            forbiddenBid: data.forbiddenBid ?? -1,
-          };
-          this.activeRoomId = data.room.roomId;
-          this.cachedRoomState = payload;
-          this.roomStateListeners.forEach((l) => l(payload));
-          this.updateRoomListingLocal(data.room);
-          this.bc?.postMessage({ type: 'BC_ROOM_UPDATE', room: data.room });
-          this.startRoomPolling(data.room.roomId);
-          this.fetchInitialRooms();
-          return payload;
-        }
-      }
-    } catch (e) {
-      console.warn('Server room creation fallback triggered:', e);
-    }
-
-    // Instant local/fallback room so the user is NEVER blocked
-    const fallbackRoomId = `WHIST-${Math.floor(1000 + Math.random() * 9000)}`;
-    const fallbackRoom: RoomSyncState = {
-      roomId: fallbackRoomId,
+    const newRoom: RoomSyncState = {
+      roomId,
       roomName: roomName?.trim() || 'Masa de Whist Românesc',
       hasPassword: !!password && password.trim().length > 0,
       password: password ? password.trim() : undefined,
@@ -437,7 +269,7 @@ class RealtimeMultiplayerService {
       players: [
         {
           id: hostPlayer.id,
-          name: hostPlayer.name || 'Tu',
+          name: hostPlayer.name || 'Gazdă',
           avatar: hostPlayer.avatar || '👑',
           isAi: false,
           seatIndex: 0,
@@ -450,67 +282,40 @@ class RealtimeMultiplayerService {
       currentRoundIdx: 0,
       phase: 'dealing',
       currentTurn: 0,
-      trumpSuit: null,
       trumpCard: null,
+      trumpSuit: null,
       currentTrick: [],
+      winningCardId: null,
+      trickWinnerBanner: null,
       statusMessage: 'Sală creată. Așteptare jucători...',
       history: [],
       updatedAt: Date.now(),
     };
 
     const payload: RoomStatePayload = {
-      room: fallbackRoom,
+      room: newRoom,
       mySeat: 0,
       myHand: [],
       legalCards: [],
       forbiddenBid: -1,
     };
 
-    this.activeRoomId = fallbackRoomId;
+    this.activeRoomId = roomId;
     this.cachedRoomState = payload;
     this.roomStateListeners.forEach((l) => l(payload));
-    this.updateRoomListingLocal(fallbackRoom);
-    this.bc?.postMessage({ type: 'BC_ROOM_UPDATE', room: fallbackRoom });
-    this.startRoomPolling(fallbackRoomId);
+
+    // Save to Firestore
+    try {
+      await setDoc(doc(db, 'rooms', roomId), newRoom);
+      this.subscribeActiveRoom(roomId, 0);
+    } catch (e) {
+      console.warn('Error saving room to Firestore:', e);
+    }
 
     return payload;
   }
 
-  // Fetch Room Info by code
-  public async fetchRoomInfo(rawRoomId: string): Promise<RoomListing | null> {
-    const roomId = normalizeRoomCode(rawRoomId);
-    if (!roomId) return null;
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2500);
-      const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`, {
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.room) {
-          const listing: RoomListing = {
-            id: data.room.roomId,
-            name: data.room.roomName,
-            hasPassword: data.room.hasPassword,
-            hostId: data.room.hostId,
-            playerCount: data.room.playerCount || 1,
-            maxPlayers: data.room.maxPlayers || 4,
-            status: data.room.status || 'lobby',
-            updatedAt: Date.now(),
-          };
-          this.updateRoomListingLocal(data.room);
-          return listing;
-        }
-      }
-    } catch {
-      // Ignored
-    }
-    return this.cachedRooms.find((r) => r.id === roomId) || null;
-  }
-
-  // Join Room
+  // Join Room in Firestore
   public async joinRoom(
     rawRoomId: string,
     player: { id: string; name: string; avatar?: string },
@@ -522,287 +327,636 @@ class RealtimeMultiplayerService {
     }
     this.activePlayerId = player.id;
 
-    // Send over WS
-    this.sendWs({
-      type: 'JOIN_ROOM',
-      roomId,
-      player,
-      password: password || undefined,
-    });
-
-    // Call REST endpoint
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3500);
-      const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          player,
-          password: password || undefined,
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      const data = await res.json();
-      if (res.ok && data.success && data.room) {
-        const payload: RoomStatePayload = {
-          room: data.room,
-          mySeat: data.mySeat ?? 0,
-          myHand: data.myHand || [],
-          legalCards: data.legalCards || [],
-          forbiddenBid: data.forbiddenBid ?? -1,
-        };
-        this.activeRoomId = roomId;
-        this.cachedRoomState = payload;
-        this.roomStateListeners.forEach((l) => l(payload));
-        this.updateRoomListingLocal(data.room);
-        this.bc?.postMessage({ type: 'BC_ROOM_UPDATE', room: data.room });
-        this.startRoomPolling(roomId);
-        this.fetchInitialRooms();
-        return { success: true, payload };
-      } else {
-        const errMsg = data.error || 'Nu s-a putut intra în cameră!';
-        this.errorListeners.forEach((l) => l(errMsg));
-        return { success: false, error: errMsg };
+      const roomRef = doc(db, 'rooms', roomId);
+      const snap = await getDoc(roomRef);
+      if (!snap.exists()) {
+        return { success: false, error: `Camera '${roomId}' nu a fost găsită pe server!` };
       }
-    } catch {
-      // Local fallback join if matching local room exists
-      if (this.cachedRoomState && this.cachedRoomState.room.roomId === roomId) {
-        const room = { ...this.cachedRoomState.room };
-        if (room.hasPassword && room.password !== password) {
-          return { success: false, error: 'Parolă incorectă!' };
-        }
+
+      const room = snap.data() as RoomSyncState;
+      if (room.hasPassword && room.password !== password) {
+        return { success: false, error: 'Parolă incorectă!' };
+      }
+
+      const existingIndex = room.players.findIndex((p) => p.id === player.id);
+      let seatIndex = existingIndex;
+
+      if (existingIndex < 0) {
         if (room.players.length >= room.maxPlayers) {
           return { success: false, error: 'Camera este plină!' };
         }
-        const seatIndex = room.players.length;
-        room.players = [
-          ...room.players,
-          {
-            id: player.id,
-            name: player.name,
-            avatar: player.avatar || '😎',
-            isAi: false,
-            seatIndex,
-            isReady: false,
-            score: 0,
-            bid: null,
-            tricksWon: 0,
-          },
-        ];
-        room.updatedAt = Date.now();
-        const payload: RoomStatePayload = {
-          room,
-          mySeat: seatIndex,
-          myHand: [],
-          legalCards: [],
-          forbiddenBid: -1,
+        if (room.status !== 'lobby') {
+          return { success: false, error: 'Partida a început deja!' };
+        }
+
+        seatIndex = room.players.length;
+        const newPlayer: RoomPlayer = {
+          id: player.id,
+          name: player.name,
+          avatar: player.avatar || '😎',
+          isAi: false,
+          seatIndex,
+          isReady: false,
+          score: 0,
+          bid: null,
+          tricksWon: 0,
         };
-        this.activeRoomId = roomId;
-        this.cachedRoomState = payload;
-        this.roomStateListeners.forEach((l) => l(payload));
-        this.updateRoomListingLocal(room);
-        this.bc?.postMessage({ type: 'BC_ROOM_UPDATE', room });
-        return { success: true, payload };
+
+        room.players.push(newPlayer);
+        room.updatedAt = Date.now();
+        await updateDoc(roomRef, {
+          players: room.players,
+          updatedAt: room.updatedAt,
+        });
       }
 
-      const errMsg = 'Eroare de conexiune la server!';
-      this.errorListeners.forEach((l) => l(errMsg));
-      return { success: false, error: errMsg };
+      const payload: RoomStatePayload = {
+        room,
+        mySeat: seatIndex,
+        myHand: this.cachedRoomState?.myHand || [],
+        legalCards: [],
+        forbiddenBid: -1,
+      };
+
+      this.activeRoomId = roomId;
+      this.cachedRoomState = payload;
+      this.roomStateListeners.forEach((l) => l(payload));
+      this.subscribeActiveRoom(roomId, seatIndex);
+
+      return { success: true, payload };
+    } catch {
+      return { success: false, error: 'Eroare de conexiune la server!' };
     }
   }
 
-  // Action Dispatcher
-  public async sendAction(roomId: string, actionData: Record<string, unknown>) {
-    // Send over WS
-    this.sendWs({
-      roomId,
-      playerId: this.activePlayerId,
-      ...actionData,
+  // Subscribe to active room document and private hand subcollection
+  private subscribeActiveRoom(roomId: string, seatIndex: number) {
+    if (this.roomDocUnsub) {
+      this.roomDocUnsub();
+      this.roomDocUnsub = null;
+    }
+    if (this.handDocUnsub) {
+      this.handDocUnsub();
+      this.handDocUnsub = null;
+    }
+
+    // 1. Listen to Room state
+    this.roomDocUnsub = onSnapshot(doc(db, 'rooms', roomId), (snap) => {
+      if (!snap.exists()) return;
+      const room = snap.data() as RoomSyncState;
+      const currentHand = this.cachedRoomState?.myHand || [];
+
+      // Calculate legal cards if it's my turn
+      const legalCards =
+        room.phase === 'playing' && room.currentTurn === seatIndex
+          ? getLegalCards(
+              currentHand,
+              room.currentTrick.map((t) => ({ playerId: t.playerId, card: t.card })),
+              room.trumpSuit,
+              true
+            )
+          : [];
+
+      // Calculate forbidden bid if dealer
+      const currentRound = room.currentRound;
+      const isDealer = currentRound ? currentRound.dealerIndex === seatIndex : false;
+      const forbiddenBid =
+        room.phase === 'bidding' && currentRound && isDealer
+          ? getForbiddenBid(
+              room.players.map((p) => p.bid ?? null),
+              currentRound.cardCount,
+              currentRound.dealerIndex,
+              seatIndex
+            ) ?? -1
+          : -1;
+
+      const payload: RoomStatePayload = {
+        room,
+        mySeat: seatIndex,
+        myHand: currentHand,
+        legalCards,
+        forbiddenBid,
+      };
+
+      this.cachedRoomState = payload;
+      this.roomStateListeners.forEach((l) => l(payload));
+
+      // Trigger AI turn processing if host and current turn is AI
+      this.checkAndProcessAiTurn(room);
     });
 
-    // Send over REST
-    try {
-      const res = await fetch(`/api/rooms/${roomId}/action`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          playerId: this.activePlayerId,
-          ...actionData,
-        }),
-      });
+    // 2. Listen to My Hand subcollection
+    this.handDocUnsub = onSnapshot(
+      doc(db, 'rooms', roomId, 'hands', String(seatIndex)),
+      (snap) => {
+        if (!snap.exists()) return;
+        const data = snap.data() as { cards?: Card[] };
+        const myHand = data.cards || [];
 
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success && data.room) {
-          const payload: RoomStatePayload = {
-            room: data.room,
-            mySeat: data.mySeat ?? 0,
-            myHand: data.myHand || this.cachedRoomState?.myHand || [],
-            legalCards: data.legalCards || this.cachedRoomState?.legalCards || [],
-            forbiddenBid: data.forbiddenBid ?? -1,
+        if (this.cachedRoomState) {
+          const room = this.cachedRoomState.room;
+          const legalCards =
+            room.phase === 'playing' && room.currentTurn === seatIndex
+              ? getLegalCards(
+                  myHand,
+                  room.currentTrick.map((t) => ({ playerId: t.playerId, card: t.card })),
+                  room.trumpSuit,
+                  true
+                )
+              : [];
+
+          const updated: RoomStatePayload = {
+            ...this.cachedRoomState,
+            myHand,
+            legalCards,
           };
-          this.cachedRoomState = payload;
-          this.roomStateListeners.forEach((l) => l(payload));
-          this.updateRoomListingLocal(data.room);
-          this.bc?.postMessage({ type: 'BC_ROOM_UPDATE', room: data.room });
-          return;
+          this.cachedRoomState = updated;
+          this.roomStateListeners.forEach((l) => l(updated));
         }
+      }
+    );
+  }
+
+  // Check and process AI turns automatically by host
+  private async checkAndProcessAiTurn(room: RoomSyncState) {
+    if (this.isProcessingAi) return;
+    if (room.status !== 'playing') return;
+    if (room.hostId !== this.activePlayerId) return;
+
+    const currentPlayer = room.players[room.currentTurn];
+    if (!currentPlayer || !currentPlayer.isAi) return;
+
+    this.isProcessingAi = true;
+    try {
+      if (room.phase === 'inspecting') {
+        // Auto-advance after 5s or host trigger
+      } else if (room.phase === 'bidding') {
+        setTimeout(async () => {
+          if (!this.cachedRoomState || this.cachedRoomState.room.phase !== 'bidding') return;
+          const freshRoom = this.cachedRoomState.room;
+          if (freshRoom.currentTurn !== currentPlayer.seatIndex) return;
+
+          // Fetch AI's hand to compute bid
+          const handSnap = await getDoc(
+            doc(db, 'rooms', room.roomId, 'hands', String(currentPlayer.seatIndex))
+          );
+          const aiHand = handSnap.exists() ? (handSnap.data().cards as Card[]) || [] : [];
+          const round = freshRoom.currentRound;
+          if (!round) return;
+
+          const isDealer = round.dealerIndex === currentPlayer.seatIndex;
+          const forbidden = isDealer
+            ? getForbiddenBid(
+                freshRoom.players.map((p) => p.bid ?? null),
+                round.cardCount,
+                round.dealerIndex,
+                currentPlayer.seatIndex
+              )
+            : -1;
+
+          const aiBid = calculateAIBid(
+            aiHand,
+            freshRoom.trumpSuit,
+            round.cardCount,
+            freshRoom.players.map((p) => p.bid ?? null),
+            round.dealerIndex,
+            currentPlayer.seatIndex
+          );
+
+          await this.placeBid(room.roomId, currentPlayer.seatIndex, aiBid);
+        }, 800);
+      } else if (room.phase === 'playing') {
+        setTimeout(async () => {
+          if (!this.cachedRoomState || this.cachedRoomState.room.phase !== 'playing') return;
+          const freshRoom = this.cachedRoomState.room;
+          if (freshRoom.currentTurn !== currentPlayer.seatIndex) return;
+
+          const handSnap = await getDoc(
+            doc(db, 'rooms', room.roomId, 'hands', String(currentPlayer.seatIndex))
+          );
+          const aiHand = handSnap.exists() ? (handSnap.data().cards as Card[]) || [] : [];
+          if (aiHand.length === 0) return;
+
+          const trickForRules = freshRoom.currentTrick.map((t) => ({
+            playerId: t.playerId,
+            card: t.card,
+          }));
+          const legal = getLegalCards(aiHand, trickForRules, freshRoom.trumpSuit, true);
+
+          const chosenCard = selectAICard(
+            legal,
+            trickForRules,
+            freshRoom.trumpSuit,
+            currentPlayer.bid ?? 0,
+            currentPlayer.tricksWon ?? 0,
+            aiHand.length
+          );
+
+          await this.playCard(room.roomId, currentPlayer.seatIndex, chosenCard);
+        }, 800);
+      }
+    } finally {
+      setTimeout(() => {
+        this.isProcessingAi = false;
+      }, 1000);
+    }
+  }
+
+  // Room Actions
+  public async addAi(roomId: string) {
+    const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.data() as RoomSyncState;
+    if (room.status !== 'lobby' || room.players.length >= room.maxPlayers) return;
+
+    const idx = room.players.length;
+    room.players.push({
+      id: `ai-${idx}-${Date.now()}`,
+      name: DEFAULT_AI_NAMES[idx - 1] || `AI ${idx}`,
+      avatar: DEFAULT_AI_AVATARS[idx - 1] || '🤖',
+      isAi: true,
+      seatIndex: idx,
+      isReady: true,
+      score: 0,
+      bid: null,
+      tricksWon: 0,
+    });
+    room.updatedAt = Date.now();
+    await updateDoc(doc(db, 'rooms', roomId), {
+      players: room.players,
+      updatedAt: room.updatedAt,
+    });
+  }
+
+  public async toggleReady(roomId: string, playerId: string) {
+    const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.data() as RoomSyncState;
+    room.players = room.players.map((p) =>
+      p.id === playerId ? { ...p, isReady: !p.isReady } : p
+    );
+    room.updatedAt = Date.now();
+    await updateDoc(doc(db, 'rooms', roomId), {
+      players: room.players,
+      updatedAt: room.updatedAt,
+    });
+  }
+
+  public async startRoomGame(roomId: string) {
+    const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.data() as RoomSyncState;
+
+    while (room.players.length < Math.max(3, room.maxPlayers)) {
+      const idx = room.players.length;
+      room.players.push({
+        id: `ai-${idx}-${Date.now()}`,
+        name: DEFAULT_AI_NAMES[idx - 1] || `AI ${idx}`,
+        avatar: DEFAULT_AI_AVATARS[idx - 1] || '🤖',
+        isAi: true,
+        seatIndex: idx,
+        isReady: true,
+        score: 0,
+        bid: null,
+        tricksWon: 0,
+      });
+    }
+
+    const count = room.players.length;
+    const rounds = generateRounds(count);
+    const round0 = rounds[0];
+    const deck = shuffleDeck(createDeck(count));
+
+    let trumpCard: Card | null = null;
+    let trumpSuit: Suit | null = null;
+    if (round0.hasTrump && deck.length > 0) {
+      trumpCard = deck.pop() || null;
+      trumpSuit = trumpCard?.suit || null;
+    }
+
+    // Deal hands and write to subcollection
+    const hands: Record<number, Card[]> = {};
+    for (let i = 0; i < count; i++) hands[i] = [];
+    for (let c = 0; c < round0.cardCount; c++) {
+      for (let p = 0; p < count; p++) {
+        const card = deck.pop();
+        if (card) hands[p].push(card);
+      }
+    }
+
+    for (let i = 0; i < count; i++) {
+      // Sort cards
+      hands[i].sort((a, b) => {
+        if (a.suit !== b.suit) return a.suit.localeCompare(b.suit);
+        return b.rank - a.rank;
+      });
+      await setDoc(doc(db, 'rooms', roomId, 'hands', String(i)), {
+        cards: hands[i],
+      });
+    }
+
+    room.roundsCount = rounds.length;
+    room.currentRoundIdx = 0;
+    room.currentRound = {
+      roundNumber: 1,
+      cardCount: round0.cardCount,
+      hasTrump: round0.hasTrump,
+      dealerIndex: round0.dealerIndex,
+    };
+    room.status = 'playing';
+    room.phase = 'inspecting';
+    room.currentTurn = (round0.dealerIndex + 1) % count;
+    room.trumpCard = trumpCard;
+    room.trumpSuit = trumpSuit;
+    room.currentTrick = [];
+    room.winningCardId = null;
+    room.trickWinnerBanner = null;
+    room.statusMessage = 'Runda 1. Analizează cărțile! Licitația începe în 5 secunde.';
+    room.updatedAt = Date.now();
+
+    await updateDoc(doc(db, 'rooms', roomId), {
+      ...room,
+    });
+  }
+
+  public async startBidding(roomId: string) {
+    const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.data() as RoomSyncState;
+    if (room.phase !== 'inspecting') return;
+
+    const round = room.currentRound;
+    const firstBidder = round ? (round.dealerIndex + 1) % room.players.length : 0;
+    room.phase = 'bidding';
+    room.currentTurn = firstBidder;
+    room.statusMessage = `Se licitează pentru Runda ${room.currentRoundIdx + 1}! Începe ${
+      room.players[firstBidder]?.name || 'Jucător'
+    }.`;
+    room.updatedAt = Date.now();
+
+    await updateDoc(doc(db, 'rooms', roomId), {
+      phase: room.phase,
+      currentTurn: room.currentTurn,
+      statusMessage: room.statusMessage,
+      updatedAt: room.updatedAt,
+    });
+  }
+
+  public async placeBid(roomId: string, seatIndex: number, bid: number) {
+    const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.data() as RoomSyncState;
+    if (room.phase !== 'bidding') return;
+
+    room.players[seatIndex].bid = bid;
+    const allBidded = room.players.every((p) => p.bid !== null && p.bid !== undefined);
+
+    if (allBidded) {
+      const round = room.currentRound;
+      const firstLeader = round ? (round.dealerIndex + 1) % room.players.length : 0;
+      room.phase = 'playing';
+      room.currentTurn = firstLeader;
+      room.statusMessage = `Licitație încheiată! ${room.players[firstLeader].name} conduce prima cupă.`;
+    } else {
+      room.currentTurn = (room.currentTurn + 1) % room.players.length;
+      room.statusMessage = `Rândul lui ${room.players[room.currentTurn].name} să liciteze.`;
+    }
+    room.updatedAt = Date.now();
+
+    await updateDoc(doc(db, 'rooms', roomId), {
+      players: room.players,
+      phase: room.phase,
+      currentTurn: room.currentTurn,
+      statusMessage: room.statusMessage,
+      updatedAt: room.updatedAt,
+    });
+  }
+
+  public async playCard(roomId: string, seatIndex: number, card: Card) {
+    const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.data() as RoomSyncState;
+    if (room.phase !== 'playing') return;
+
+    // 1. Remove card from player hand in subcollection
+    const handRef = doc(db, 'rooms', roomId, 'hands', String(seatIndex));
+    const handSnap = await getDoc(handRef);
+    if (handSnap.exists()) {
+      const cards = ((handSnap.data().cards as Card[]) || []).filter((c) => c.id !== card.id);
+      await updateDoc(handRef, { cards });
+    }
+
+    // 2. Add to trick
+    const player = room.players[seatIndex];
+    room.currentTrick.push({
+      playerId: seatIndex,
+      card,
+      playerName: player.name,
+    });
+
+    if (room.currentTrick.length === room.players.length) {
+      // Trick complete
+      room.phase = 'trick_eval';
+      const trickForRules = room.currentTrick.map((t) => ({
+        playerId: t.playerId,
+        card: t.card,
+      }));
+      const evalResult = evaluateTrickWinner(trickForRules, room.trumpSuit);
+      const winnerSeat = evalResult.winnerPlayerId;
+      const winnerPlayer = room.players[winnerSeat];
+      winnerPlayer.tricksWon = (winnerPlayer.tricksWon || 0) + 1;
+
+      room.winningCardId = evalResult.winningCard.id;
+      room.trickWinnerBanner = {
+        winnerName: winnerPlayer.name,
+        reason: evalResult.reason,
+        winningCard: evalResult.winningCard,
+      };
+      room.statusMessage = `${winnerPlayer.name} a luat cupa!`;
+      room.updatedAt = Date.now();
+      await updateDoc(doc(db, 'rooms', roomId), { ...room });
+
+      // After 1.6s evaluate next trick or end round
+      setTimeout(async () => {
+        const freshSnap = await getDoc(doc(db, 'rooms', roomId));
+        if (!freshSnap.exists()) return;
+        const fresh = freshSnap.data() as RoomSyncState;
+
+        // Check if hand is empty
+        const remainingHandSnap = await getDoc(
+          doc(db, 'rooms', roomId, 'hands', String(winnerSeat))
+        );
+        const remCards = remainingHandSnap.exists()
+          ? (remainingHandSnap.data().cards as Card[]) || []
+          : [];
+
+        if (remCards.length === 0) {
+          // Round finished! Finalize scores
+          const recapList = fresh.players.map((p) => {
+            const pts = calculateRoundPoints(p.bid ?? 0, p.tricksWon || 0);
+            return {
+              bid: p.bid ?? 0,
+              tricksWon: p.tricksWon || 0,
+              points: pts,
+              runningTotal: p.score + pts,
+            };
+          });
+
+          fresh.players.forEach((p, idx) => {
+            p.score = recapList[idx].runningTotal;
+          });
+
+          fresh.history = fresh.history || [];
+          fresh.history.push({
+            roundNumber: fresh.currentRoundIdx + 1,
+            cardCount: fresh.currentRound?.cardCount || 1,
+            trumpSuit: fresh.trumpSuit,
+            playerResults: recapList,
+          });
+
+          fresh.phase = 'round_recap';
+          fresh.currentTrick = [];
+          fresh.winningCardId = null;
+          fresh.trickWinnerBanner = null;
+          fresh.statusMessage = `Runda ${fresh.currentRoundIdx + 1} s-a încheiat!`;
+          fresh.updatedAt = Date.now();
+          await updateDoc(doc(db, 'rooms', roomId), { ...fresh });
+        } else {
+          // Next trick
+          fresh.phase = 'playing';
+          fresh.currentTrick = [];
+          fresh.winningCardId = null;
+          fresh.trickWinnerBanner = null;
+          fresh.currentTurn = winnerSeat;
+          fresh.statusMessage = `Cupa nouă. Conduce ${winnerPlayer.name}.`;
+          fresh.updatedAt = Date.now();
+          await updateDoc(doc(db, 'rooms', roomId), { ...fresh });
+        }
+      }, 1600);
+    } else {
+      room.currentTurn = (room.currentTurn + 1) % room.players.length;
+      room.statusMessage = `Rândul lui ${room.players[room.currentTurn].name}.`;
+      room.updatedAt = Date.now();
+      await updateDoc(doc(db, 'rooms', roomId), {
+        currentTrick: room.currentTrick,
+        currentTurn: room.currentTurn,
+        statusMessage: room.statusMessage,
+        updatedAt: room.updatedAt,
+      });
+    }
+  }
+
+  public async nextRound(roomId: string) {
+    const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.data() as RoomSyncState;
+
+    const count = room.players.length;
+    const rounds = generateRounds(count);
+    const nextIdx = room.currentRoundIdx + 1;
+
+    if (nextIdx >= rounds.length) {
+      room.status = 'game_over';
+      room.statusMessage = 'Joc terminat!';
+      room.updatedAt = Date.now();
+      await updateDoc(doc(db, 'rooms', roomId), { ...room });
+      return;
+    }
+
+    const nextRoundConfig = rounds[nextIdx];
+    const deck = shuffleDeck(createDeck(count));
+
+    let trumpCard: Card | null = null;
+    let trumpSuit: Suit | null = null;
+    if (nextRoundConfig.hasTrump && deck.length > 0) {
+      trumpCard = deck.pop() || null;
+      trumpSuit = trumpCard?.suit || null;
+    }
+
+    const hands: Record<number, Card[]> = {};
+    for (let i = 0; i < count; i++) hands[i] = [];
+    for (let c = 0; c < nextRoundConfig.cardCount; c++) {
+      for (let p = 0; p < count; p++) {
+        const card = deck.pop();
+        if (card) hands[p].push(card);
+      }
+    }
+
+    for (let i = 0; i < count; i++) {
+      hands[i].sort((a, b) => {
+        if (a.suit !== b.suit) return a.suit.localeCompare(b.suit);
+        return b.rank - a.rank;
+      });
+      await setDoc(doc(db, 'rooms', roomId, 'hands', String(i)), {
+        cards: hands[i],
+      });
+    }
+
+    room.players.forEach((p) => {
+      p.bid = null;
+      p.tricksWon = 0;
+    });
+
+    room.currentRoundIdx = nextIdx;
+    room.currentRound = {
+      roundNumber: nextIdx + 1,
+      cardCount: nextRoundConfig.cardCount,
+      hasTrump: nextRoundConfig.hasTrump,
+      dealerIndex: nextRoundConfig.dealerIndex,
+    };
+    room.phase = 'inspecting';
+    room.currentTurn = (nextRoundConfig.dealerIndex + 1) % count;
+    room.trumpCard = trumpCard;
+    room.trumpSuit = trumpSuit;
+    room.currentTrick = [];
+    room.winningCardId = null;
+    room.trickWinnerBanner = null;
+    room.statusMessage = `Runda ${nextIdx + 1} (${nextRoundConfig.cardCount} cărți). Analizează cărțile!`;
+    room.updatedAt = Date.now();
+
+    await updateDoc(doc(db, 'rooms', roomId), { ...room });
+  }
+
+  public async leaveRoom(roomId: string, playerId: string) {
+    if (this.roomDocUnsub) {
+      this.roomDocUnsub();
+      this.roomDocUnsub = null;
+    }
+    if (this.handDocUnsub) {
+      this.handDocUnsub();
+      this.handDocUnsub = null;
+    }
+
+    this.activeRoomId = null;
+    this.cachedRoomState = null;
+
+    try {
+      const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+      if (!roomSnap.exists()) return;
+      const room = roomSnap.data() as RoomSyncState;
+      room.players = room.players.filter((p) => p.id !== playerId);
+
+      const hasHumans = room.players.some((p) => !p.isAi);
+      if (room.players.length === 0 || !hasHumans) {
+        await deleteDoc(doc(db, 'rooms', roomId));
+      } else {
+        room.players.forEach((p, idx) => {
+          p.seatIndex = idx;
+        });
+        if (room.hostId === playerId && room.players[0]) {
+          room.hostId = room.players[0].id;
+        }
+        room.updatedAt = Date.now();
+        await updateDoc(doc(db, 'rooms', roomId), {
+          players: room.players,
+          hostId: room.hostId,
+          updatedAt: room.updatedAt,
+        });
       }
     } catch {
       // Ignored
     }
-
-    // Local optimistic update fallback for seamless responsiveness
-    if (this.cachedRoomState && this.cachedRoomState.room.roomId === roomId) {
-      const room = { ...this.cachedRoomState.room };
-      const actionType = actionData.type as string;
-
-      if (actionType === 'ADD_AI' && room.players.length < room.maxPlayers) {
-        const idx = room.players.length;
-        const aiNames = ['Radu (AI)', 'Elena (AI)', 'Mihai (AI)', 'Andrei (AI)', 'Ioana (AI)'];
-        const aiAvatars = ['🦊', '🦉', '🐻', '🦁', '🐺'];
-        room.players = [
-          ...room.players,
-          {
-            id: `ai-${idx}-${Date.now()}`,
-            name: aiNames[idx - 1] || `AI ${idx}`,
-            avatar: aiAvatars[idx - 1] || '🤖',
-            isAi: true,
-            seatIndex: idx,
-            isReady: true,
-            score: 0,
-            bid: null,
-            tricksWon: 0,
-          },
-        ];
-        room.updatedAt = Date.now();
-        const updatedPayload = { ...this.cachedRoomState, room };
-        this.cachedRoomState = updatedPayload;
-        this.roomStateListeners.forEach((l) => l(updatedPayload));
-        this.updateRoomListingLocal(room);
-        this.bc?.postMessage({ type: 'BC_ROOM_UPDATE', room });
-      } else if (actionType === 'TOGGLE_READY') {
-        const pId = (actionData.playerId as string) || this.activePlayerId;
-        room.players = room.players.map((p) =>
-          p.id === pId ? { ...p, isReady: !p.isReady } : p
-        );
-        room.updatedAt = Date.now();
-        const updatedPayload = { ...this.cachedRoomState, room };
-        this.cachedRoomState = updatedPayload;
-        this.roomStateListeners.forEach((l) => l(updatedPayload));
-        this.updateRoomListingLocal(room);
-        this.bc?.postMessage({ type: 'BC_ROOM_UPDATE', room });
-      } else if (actionType === 'START_ROOM_GAME') {
-        // Fallback local game launch if server took longer
-        while (room.players.length < Math.max(3, room.maxPlayers)) {
-          const idx = room.players.length;
-          const aiNames = ['Radu (AI)', 'Elena (AI)', 'Mihai (AI)', 'Andrei (AI)', 'Ioana (AI)'];
-          const aiAvatars = ['🦊', '🦉', '🐻', '🦁', '🐺'];
-          room.players.push({
-            id: `ai-${idx}-${Date.now()}`,
-            name: aiNames[idx - 1] || `AI ${idx}`,
-            avatar: aiAvatars[idx - 1] || '🤖',
-            isAi: true,
-            seatIndex: idx,
-            isReady: true,
-            score: 0,
-            bid: null,
-            tricksWon: 0,
-          });
-        }
-        const count = room.players.length;
-        const rounds = generateRounds(count);
-        room.roundsCount = rounds.length;
-        room.currentRoundIdx = 0;
-        room.currentRound = {
-          roundNumber: rounds[0].roundIndex + 1,
-          cardCount: rounds[0].cardCount,
-          hasTrump: rounds[0].hasTrump,
-          dealerIndex: rounds[0].dealerIndex,
-        };
-        room.status = 'playing';
-        room.phase = 'inspecting';
-        room.currentTurn = (rounds[0].dealerIndex + 1) % count;
-
-        const deck = shuffleDeck(createDeck(count));
-        let trumpCard: Card | null = null;
-        let trumpSuit: Suit | null = null;
-        if (rounds[0].hasTrump && deck.length > 0) {
-          trumpCard = deck.pop() || null;
-          trumpSuit = trumpCard?.suit || null;
-        }
-        room.trumpCard = trumpCard;
-        room.trumpSuit = trumpSuit;
-
-        // Deal hands
-        const hands: Record<number, Card[]> = {};
-        for (let i = 0; i < count; i++) hands[i] = [];
-        for (let c = 0; c < rounds[0].cardCount; c++) {
-          for (let p = 0; p < count; p++) {
-            const card = deck.pop();
-            if (card) hands[p].push(card);
-          }
-        }
-        this.localHands = hands;
-        const mySeat = this.cachedRoomState.mySeat;
-        const myHand = hands[mySeat] || [];
-
-        room.updatedAt = Date.now();
-        const updatedPayload: RoomStatePayload = {
-          room,
-          mySeat,
-          myHand,
-          legalCards: [],
-          forbiddenBid: -1,
-        };
-        this.cachedRoomState = updatedPayload;
-        this.roomStateListeners.forEach((l) => l(updatedPayload));
-        this.updateRoomListingLocal(room);
-        this.bc?.postMessage({ type: 'BC_ROOM_UPDATE', room });
-      }
-    }
-  }
-
-  public addAi(roomId: string) {
-    this.sendAction(roomId, { type: 'ADD_AI' });
-  }
-
-  public toggleReady(roomId: string, playerId: string) {
-    this.sendAction(roomId, { type: 'TOGGLE_READY', playerId });
-  }
-
-  public startRoomGame(roomId: string) {
-    this.sendAction(roomId, { type: 'START_ROOM_GAME' });
-  }
-
-  public startBidding(roomId: string) {
-    this.sendAction(roomId, { type: 'START_BIDDING' });
-  }
-
-  public placeBid(roomId: string, seatIndex: number, bid: number) {
-    this.sendAction(roomId, { type: 'PLACE_BID', seatIndex, bid });
-  }
-
-  public playCard(roomId: string, seatIndex: number, card: Card) {
-    this.sendAction(roomId, { type: 'PLAY_CARD', seatIndex, card });
-  }
-
-  public nextRound(roomId: string) {
-    this.sendAction(roomId, { type: 'NEXT_ROUND' });
-  }
-
-  public leaveRoom(roomId: string, playerId: string) {
-    this.sendAction(roomId, { type: 'LEAVE_ROOM', playerId });
-    this.activeRoomId = null;
-    this.cachedRoomState = null;
-    if (this.pollingTimer) {
-      clearInterval(this.pollingTimer);
-      this.pollingTimer = null;
-    }
-    this.fetchInitialRooms();
   }
 }
 
